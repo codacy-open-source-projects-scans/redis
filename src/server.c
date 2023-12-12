@@ -2651,9 +2651,11 @@ void makeThreadKillable(void) {
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
 }
 
+/* When adding fields, please check the initTempDb related logic. */
 void initDbState(redisDb *db){
     for (dbKeyType subdict = DB_MAIN; subdict <= DB_EXPIRES; subdict++) {
         db->sub_dict[subdict].rehashing = listCreate();
+        db->sub_dict[subdict].non_empty_slots = 0;
         db->sub_dict[subdict].key_count = 0;
         db->sub_dict[subdict].resize_cursor = -1;
         db->sub_dict[subdict].slot_size_index = server.cluster_enabled ? zcalloc(sizeof(unsigned long long) * (CLUSTER_SLOTS + 1)) : NULL;
