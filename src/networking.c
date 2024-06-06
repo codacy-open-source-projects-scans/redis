@@ -31,6 +31,14 @@ size_t sdsZmallocSize(sds s) {
     return zmalloc_size(sh);
 }
 
+/* Return the size consumed from the allocator, for the specified hfield with
+ * metadata (mstr), including internal fragmentation. This function is used in
+ * order to compute the client output buffer size. */
+size_t hfieldZmallocSize(hfield s) {
+    void *sh = hfieldGetAllocPtr(s);
+    return zmalloc_size(sh);
+}
+
 /* Return the amount of memory used by the sds string at object->ptr
  * for a string object. This includes internal fragmentation. */
 size_t getStringObjectSdsUsedMemory(robj *o) {
@@ -1539,6 +1547,18 @@ void clearClientConnectionState(client *c) {
     /* Selectively clear state flags not covered above */
     c->flags &= ~(CLIENT_ASKING|CLIENT_READONLY|CLIENT_REPLY_OFF|
                   CLIENT_REPLY_SKIP_NEXT|CLIENT_NO_TOUCH|CLIENT_NO_EVICT);
+}
+
+void deauthenticateAndCloseClient(client *c) {
+    c->user = DefaultUser;
+    c->authenticated = 0;
+    /* We will write replies to this client later, so we can't
+     * close it directly even if async. */
+    if (c == server.current_client) {
+        c->flags |= CLIENT_CLOSE_AFTER_COMMAND;
+    } else {
+        freeClientAsync(c);
+    }
 }
 
 void freeClient(client *c) {
@@ -3749,7 +3769,9 @@ void replaceClientCommandVector(client *c, int argc, robj **argv) {
  * 1. Make sure there are no "holes" and all the arguments are set.
  * 2. If the original argument vector was longer than the one we
  *    want to end with, it's up to the caller to set c->argc and
- *    free the no longer used objects on c->argv. */
+ *    free the no longer used objects on c->argv.
+ * 3. To remove argument at i'th index, pass NULL as new value
+ */
 void rewriteClientCommandArgument(client *c, int i, robj *newval) {
     robj *oldval;
     retainOriginalCommandVector(c);
@@ -3767,9 +3789,18 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
     }
     oldval = c->argv[i];
     if (oldval) c->argv_len_sum -= getStringObjectLen(oldval);
-    if (newval) c->argv_len_sum += getStringObjectLen(newval);
-    c->argv[i] = newval;
-    incrRefCount(newval);
+
+    if (newval) {
+        c->argv[i] = newval;
+        incrRefCount(newval);
+        c->argv_len_sum += getStringObjectLen(newval);
+    } else {
+        /* move the remaining arguments one step left */
+        for (int j = i+1; j < c->argc; j++) {
+            c->argv[j-1] = c->argv[j];
+        }
+        c->argv[--c->argc] = NULL;
+    }
     if (oldval) decrRefCount(oldval);
 
     /* If this is the command name make sure to fix c->cmd. */
