@@ -117,15 +117,12 @@ start_server {tags {"external:skip needs:debug"}} {
             r config set hash-max-listpack-entries 512
         }
 
-        test "HEXPIRE/HEXPIREAT/HPEXPIRE/HPEXPIREAT - Returns empty array if key does not exist" {
+        test "HEXPIRE/HEXPIREAT/HPEXPIRE/HPEXPIREAT - Returns array if the key does not exist" {
             r del myhash
-            # Make sure we can distinguish between an empty array and a null response
-            r readraw 1
-            assert_equal {*0} [r HEXPIRE myhash 1000 FIELDS 1 a]
-            assert_equal {*0} [r HEXPIREAT myhash 1000 FIELDS 1 a]
-            assert_equal {*0} [r HPEXPIRE myhash 1000 FIELDS 1 a]
-            assert_equal {*0} [r HPEXPIREAT myhash 1000 FIELDS 1 a]
-            r readraw 0
+            assert_equal [r HEXPIRE myhash 1000 FIELDS 1 a] [list $E_NO_FIELD]
+            assert_equal [r HEXPIREAT myhash 1000 FIELDS 1 a] [list $E_NO_FIELD]
+            assert_equal [r HPEXPIRE myhash 1000 FIELDS 2 a b] [list $E_NO_FIELD $E_NO_FIELD]
+            assert_equal [r HPEXPIREAT myhash 1000 FIELDS 2 a b] [list $E_NO_FIELD $E_NO_FIELD]
         }
 
         test "HEXPIRE/HEXPIREAT/HPEXPIRE/HPEXPIREAT - Verify that the expire time does not overflow" {
@@ -208,12 +205,12 @@ start_server {tags {"external:skip needs:debug"}} {
             assert_error {*Parameter `numFields` is more than number of arguments} {r hpexpire myhash 1000 NX FIELDS 4 f1 f2 f3}
         }
 
-        test "HPEXPIRE - parameter expire-time near limit of  2^48 ($type)" {
+        test "HPEXPIRE - parameter expire-time near limit of  2^46 ($type)" {
             r del myhash
             r hset myhash f1 v1
             # below & above
-            assert_equal [r hpexpire myhash [expr (1<<48) - [clock milliseconds] - 1000 ] FIELDS 1 f1] [list  $E_OK]
-            assert_error {*invalid expire time*} {r hpexpire myhash [expr (1<<48) - [clock milliseconds] + 100 ] FIELDS 1 f1}
+            assert_equal [r hpexpire myhash [expr (1<<46) - [clock milliseconds] - 1000 ] FIELDS 1 f1] [list  $E_OK]
+            assert_error {*invalid expire time*} {r hpexpire myhash [expr (1<<46) - [clock milliseconds] + 100 ] FIELDS 1 f1}
         }
 
         test "Lazy Expire - fields are lazy deleted ($type)" {
@@ -305,13 +302,10 @@ start_server {tags {"external:skip needs:debug"}} {
             r flushall async
         }
 
-        test "HTTL/HPTTL - Returns empty array if key does not exist" {
+        test "HTTL/HPTTL - Returns array if the key does not exist" {
             r del myhash
-            # Make sure we can distinguish between an empty array and a null response
-            r readraw 1
-            assert_equal {*0} [r HTTL myhash FIELDS 1 a]
-            assert_equal {*0} [r HPTTL myhash FIELDS 1 a]
-            r readraw 0
+            assert_equal [r HTTL myhash FIELDS 1 a] [list $T_NO_FIELD]
+            assert_equal [r HPTTL myhash FIELDS 2 a b] [list $T_NO_FIELD $T_NO_FIELD]
         }
 
         test "HTTL/HPTTL - Input validation gets failed on nonexists field or field without expire ($type)" {
@@ -320,7 +314,6 @@ start_server {tags {"external:skip needs:debug"}} {
             r HPEXPIRE myhash 1000 NX FIELDS 1 field1
 
             foreach cmd {HTTL HPTTL} {
-                assert_equal [r $cmd non_exists_key FIELDS 1 f] {}
                 assert_equal [r $cmd myhash FIELDS 2 field2 non_exists_field] "$T_NO_EXPIRY $T_NO_FIELD"
                 # Set numFields less than actual number of fields. Fine.
                 assert_equal [r $cmd myhash FIELDS 1 non_exists_field1 non_exists_field2] "$T_NO_FIELD"
@@ -337,13 +330,10 @@ start_server {tags {"external:skip needs:debug"}} {
             assert_range $ttl 1000 2000
         }
 
-        test "HEXPIRETIME/HPEXPIRETIME - Returns empty array if key does not exist" {
+        test "HEXPIRETIME/HPEXPIRETIME - Returns array if the key does not exist" {
             r del myhash
-            # Make sure we can distinguish between an empty array and a null response
-            r readraw 1
-            assert_equal {*0} [r HEXPIRETIME myhash FIELDS 1 a]
-            assert_equal {*0} [r HPEXPIRETIME myhash FIELDS 1 a]
-            r readraw 0
+            assert_equal [r HEXPIRETIME myhash FIELDS 1 a] [list $T_NO_FIELD]
+            assert_equal [r HPEXPIRETIME myhash FIELDS 2 a b] [list $T_NO_FIELD $T_NO_FIELD]
         }
 
         test "HEXPIRETIME - returns TTL in Unix timestamp ($type)" {
@@ -711,12 +701,10 @@ start_server {tags {"external:skip needs:debug"}} {
             r debug set-active-expire 1
         }
 
-        test "HPERSIST - Returns empty array if key does not exist ($type)" {
+        test "HPERSIST - Returns array if the key does not exist ($type)" {
             r del myhash
-            # Make sure we can distinguish between an empty array and a null response
-            r readraw 1
-            assert_equal {*0} [r HPERSIST myhash FIELDS 1 a]
-            r readraw 0
+            assert_equal [r HPERSIST myhash FIELDS 1 a] [list $P_NO_FIELD]
+            assert_equal [r HPERSIST myhash FIELDS 2 a b] [list $P_NO_FIELD $P_NO_FIELD]
         }
 
         test "HPERSIST - input validation ($type)" {
@@ -726,7 +714,6 @@ start_server {tags {"external:skip needs:debug"}} {
             r hexpire myhash 1000 NX FIELDS 1 f1
             assert_error {*wrong number of arguments*} {r hpersist myhash}
             assert_error {*wrong number of arguments*} {r hpersist myhash FIELDS 1}
-            assert_equal [r hpersist not-exists-key FIELDS 1 f1] {}
             assert_equal [r hpersist myhash FIELDS 2 f1 not-exists-field] "$P_OK $P_NO_FIELD"
             assert_equal [r hpersist myhash FIELDS 1 f2] "$P_NO_EXPIRY"
         }
@@ -1103,8 +1090,11 @@ start_server {tags {"external:skip needs:debug"}} {
             r hexpireat h1 [expr [clock seconds]+100] NX FIELDS 1 f1
             r hset h2 f2 v2
             r hpexpireat h2 [expr [clock seconds]*1000+100000] NX FIELDS 1 f2
-            r hset h3 f3 v3 f4 v4
+            r hset h3 f3 v3 f4 v4 f5 v5
+            # hpersist does nothing here. Verify it is not propagated.
+            r hpersist h3 FIELDS 1 f5
             r hexpire h3 100 FIELDS 3 f3 f4 non_exists_field
+            r hpersist h3 FIELDS 1 f3
 
             assert_replication_stream $repl {
                 {select *}
@@ -1112,8 +1102,9 @@ start_server {tags {"external:skip needs:debug"}} {
                 {hpexpireat h1 * NX FIELDS 1 f1}
                 {hset h2 f2 v2}
                 {hpexpireat h2 * NX FIELDS 1 f2}
-                {hset h3 f3 v3 f4 v4}
+                {hset h3 f3 v3 f4 v4 f5 v5}
                 {hpexpireat h3 * FIELDS 3 f3 f4 non_exists_field}
+                {hpersist h3 FIELDS 1 f3}
             }
             close_replication_stream $repl
         } {} {needs:repl}

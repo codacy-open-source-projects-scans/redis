@@ -2071,7 +2071,8 @@ struct redisServer {
     char *locale_collate;
 };
 
-#define MAX_KEYS_BUFFER 256
+/* we use 6 so that all getKeyResult fits a cacheline */
+#define MAX_KEYS_BUFFER 6
 
 typedef struct {
     int pos; /* The position of the key within the client array */
@@ -2084,12 +2085,12 @@ typedef struct {
  * for returning channel information.
  */
 typedef struct {
+    int numkeys;                                 /* Number of key indices return */
+    int size;                                    /* Available array size */
     keyReference keysbuf[MAX_KEYS_BUFFER];       /* Pre-allocated buffer, to save heap allocations */
     keyReference *keys;                          /* Key indices array, points to keysbuf or heap */
-    int numkeys;                        /* Number of key indices return */
-    int size;                           /* Available array size */
 } getKeysResult;
-#define GETKEYS_RESULT_INIT { {{0}}, NULL, 0, MAX_KEYS_BUFFER }
+#define GETKEYS_RESULT_INIT { 0, MAX_KEYS_BUFFER, {{0}}, NULL }
 
 /* Key specs definitions.
  *
@@ -3191,9 +3192,16 @@ typedef struct dictExpireMetadata {
 #define HASH_SET_TAKE_VALUE (1<<1)
 #define HASH_SET_COPY 0
 
+/* Hash field lazy expiration flags. Used by core hashTypeGetValue() and its callers */
+#define HFE_LAZY_EXPIRE           (0) /* Delete expired field, and if last field also the hash */
+#define HFE_LAZY_AVOID_FIELD_DEL  (1<<0) /* Avoid deleting expired field */
+#define HFE_LAZY_AVOID_HASH_DEL   (1<<1) /* Avoid deleting hash if the field is the last one */
+#define HFE_LAZY_NO_NOTIFICATION  (1<<2) /* Do not send notification, used when multiple fields
+                                          * may expire and only one notification is desired. */
+
 void hashTypeConvert(robj *o, int enc, ebuckets *hexpires);
 void hashTypeTryConversion(redisDb *db, robj *subject, robj **argv, int start, int end);
-int hashTypeExists(redisDb *db, robj *o, sds key, int *isHashDeleted);
+int hashTypeExists(redisDb *db, robj *o, sds key, int hfeFlags, int *isHashDeleted);
 int hashTypeDelete(robj *o, void *key, int isSdsField);
 unsigned long hashTypeLength(const robj *o, int subtractExpiredFields);
 hashTypeIterator *hashTypeInitIterator(robj *subject);
@@ -3210,7 +3218,7 @@ void hashTypeCurrentObject(hashTypeIterator *hi, int what, unsigned char **vstr,
                            unsigned int *vlen, long long *vll, uint64_t *expireTime);
 sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what);
 hfield hashTypeCurrentObjectNewHfield(hashTypeIterator *hi);
-robj *hashTypeGetValueObject(redisDb *db, robj *o, sds field, int *isHashDeleted);
+robj *hashTypeGetValueObject(redisDb *db, robj *o, sds field, int hfeFlags, int *isHashDeleted);
 int hashTypeSet(redisDb *db, robj *o, sds field, sds value, int flags);
 robj *hashTypeDup(robj *o, sds newkey, uint64_t *minHashExpire);
 uint64_t hashTypeRemoveFromExpires(ebuckets *hexpires, robj *o);
