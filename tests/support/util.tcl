@@ -293,7 +293,6 @@ proc findKeyWithType {r type} {
 
 proc createComplexDataset {r ops {opt {}}} {
     set useexpire [expr {[lsearch -exact $opt useexpire] != -1}]
-    # TODO: Remove usehexpire on next commit, when RDB will support replication
     set usehexpire [expr {[lsearch -exact $opt usehexpire] != -1}]
 
     if {[lsearch -exact $opt usetag] != -1} {
@@ -1155,8 +1154,7 @@ proc system_backtrace_supported {} {
 
     # libmusl does not support backtrace. Also return 0 on
     # static binaries (ldd exit code 1) where we can't detect libmusl
-    catch {
-        set ldd [exec ldd src/redis-server]
+    if {![catch {set ldd [exec ldd src/redis-server]}]} {
         if {![string match {*libc.*musl*} $ldd]} {
             return 1
         }
