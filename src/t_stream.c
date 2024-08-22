@@ -1441,6 +1441,17 @@ void streamReplyWithCGLag(client *c, stream *s, streamCG *cg) {
         /* The lag of a newly-initialized stream is 0. */
         lag = 0;
         valid = 1;
+    } else if (!s->length) { /* All entries deleted, now empty. */
+        lag = 0;
+        valid = 1;
+    } else if (streamCompareID(&cg->last_id,&s->first_id) < 0 &&
+               streamCompareID(&s->max_deleted_entry_id,&s->first_id) < 0)
+    {
+        /* When both the consumer group's last_id and the maximum tombstone are behind
+         * the stream's first entry, the consumer group's lag will always be equal to
+         * the number of remainin entries in the stream. */
+        lag = s->length;
+        valid = 1;
     } else if (cg->entries_read != SCG_INVALID_ENTRIES_READ && !streamRangeHasTombstones(s,&cg->last_id,NULL)) {
         /* No fragmentation ahead means that the group's logical reads counter
          * is valid for performing the lag calculation. */
@@ -2189,9 +2200,9 @@ void xreadCommand(client *c) {
             streams_arg = i+1;
             streams_count = (c->argc-streams_arg);
             if ((streams_count % 2) != 0) {
-                char symbol = xreadgroup ? '>' : '$';
+                const char *symbol = xreadgroup ? "ID or '>'" : "ID, '+', or '$'";
                 addReplyErrorFormat(c,"Unbalanced '%s' list of streams: "
-                                      "for each stream key an ID or '%c' must be "
+                                      "for each stream key an %s must be "
                                       "specified.", c->cmd->fullname,symbol);
                 return;
             }
