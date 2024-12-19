@@ -41,10 +41,6 @@
 #include <systemd/sd-daemon.h>
 #endif
 
-#ifndef static_assert
-#define static_assert(expr, lit) extern char __static_assert_failure[(expr) ? 1:-1]
-#endif
-
 typedef long long mstime_t; /* millisecond time type. */
 typedef long long ustime_t; /* microsecond time type. */
 
@@ -278,6 +274,7 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
                                        * out to all keys it should cover */
 #define CMD_KEY_VARIABLE_FLAGS (1ULL<<10)  /* Means that some keys might have
                                             * different flags depending on arguments */
+#define CMD_KEY_PREFIX (1ULL<<11) /* Given key represents a prefix of a set of keys */
 
 /* Key flags for when access type is unknown */
 #define CMD_KEY_FULL_ACCESS (CMD_KEY_RW | CMD_KEY_ACCESS | CMD_KEY_UPDATE)
@@ -698,6 +695,7 @@ typedef enum {
 #define OBJ_SET 2       /* Set object. */
 #define OBJ_ZSET 3      /* Sorted set object. */
 #define OBJ_HASH 4      /* Hash object. */
+#define OBJ_TYPE_BASIC_MAX 5 /* Max number of basic object types. */
 
 /* The "module" object type is a special one that signals that the object
  * is one directly managed by a Redis module. In this case the value points
@@ -969,7 +967,7 @@ typedef struct replBufBlock {
  * by integers from 0 (the default database) up to the max configured
  * database. The database number is the 'id' field in the structure. */
 typedef struct redisDb {
-    kvstore *keys;              /* The keyspace for this DB */
+    kvstore *keys;              /* The keyspace for this DB. As metadata, holds keysizes histogram */
     kvstore *expires;           /* Timeout of keys with a timeout set */
     ebuckets hexpires;          /* Hash expiration DS. Single TTL per hash (of next min field to expire) */
     dict *blocking_keys;        /* Keys with clients waiting for data (BLPOP)*/
@@ -1404,8 +1402,9 @@ struct redisMemOverhead {
     size_t clients_normal;
     size_t cluster_links;
     size_t aof_buffer;
-    size_t lua_caches;
+    size_t eval_caches;
     size_t functions_caches;
+    size_t script_vm;
     size_t overhead_total;
     size_t dataset;
     size_t total_keys;
@@ -1592,7 +1591,7 @@ struct redisServer {
     dict *moduleapi;            /* Exported core APIs dictionary for modules. */
     dict *sharedapi;            /* Like moduleapi but containing the APIs that
                                    modules share with each other. */
-    dict *module_configs_queue; /* Dict that stores module configurations from .conf file until after modules are loaded during startup or arguments to loadex. */
+    dict *module_configs_queue; /* Unmapped configs are queued here, assumed to be module config. Applied after modules are loaded during startup or arguments to loadex. */
     list *loadmodule_queue;     /* List of modules to load at startup. */
     int module_pipe[2];         /* Pipe used to awake the event loop by module threads. */
     pid_t child_pid;            /* PID of current child */
@@ -2513,7 +2512,7 @@ void moduleInitModulesSystem(void);
 void moduleInitModulesSystemLast(void);
 void modulesCron(void);
 int moduleLoad(const char *path, void **argv, int argc, int is_loadex);
-int moduleUnload(sds name, const char **errmsg);
+int moduleUnload(sds name, const char **errmsg, int forced_unload);
 void moduleLoadFromQueue(void);
 int moduleGetCommandKeysViaAPI(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result);
 int moduleGetCommandChannelsViaAPI(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result);
@@ -2799,6 +2798,7 @@ int isSdsRepresentableAsLongLong(sds s, long long *llval);
 int isObjectRepresentableAsLongLong(robj *o, long long *llongval);
 robj *tryObjectEncoding(robj *o);
 robj *tryObjectEncodingEx(robj *o, int try_trim);
+size_t getObjectLength(robj *o);
 robj *getDecodedObject(robj *o);
 size_t stringObjectLen(robj *o);
 robj *createStringObjectFromLongLong(long long value);
@@ -3242,7 +3242,8 @@ void hashTypeCurrentObject(hashTypeIterator *hi, int what, unsigned char **vstr,
                            unsigned int *vlen, long long *vll, uint64_t *expireTime);
 sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what);
 hfield hashTypeCurrentObjectNewHfield(hashTypeIterator *hi);
-robj *hashTypeGetValueObject(redisDb *db, robj *o, sds field, int hfeFlags, int *isHashDeleted);
+int hashTypeGetValueObject(redisDb *db, robj *o, sds field, int hfeFlags,
+                           robj **val, uint64_t *expireTime, int *isHashDeleted);
 int hashTypeSet(redisDb *db, robj *o, sds field, sds value, int flags);
 robj *hashTypeDup(robj *o, sds newkey, uint64_t *minHashExpire);
 uint64_t hashTypeRemoveFromExpires(ebuckets *hexpires, robj *o);
@@ -3347,10 +3348,10 @@ void freeServerClientMemUsageBuckets(void);
 typedef struct ModuleConfig ModuleConfig;
 int performModuleConfigSetFromName(sds name, sds value, const char **err);
 int performModuleConfigSetDefaultFromName(sds name, const char **err);
-void addModuleBoolConfig(const char *module_name, const char *name, int flags, void *privdata, int default_val);
-void addModuleStringConfig(const char *module_name, const char *name, int flags, void *privdata, sds default_val);
-void addModuleEnumConfig(const char *module_name, const char *name, int flags, void *privdata, int default_val, configEnum *enum_vals);
-void addModuleNumericConfig(const char *module_name, const char *name, int flags, void *privdata, long long default_val, int conf_flags, long long lower, long long upper);
+void addModuleBoolConfig(sds name, sds alias, int flags, void *privdata, int default_val);
+void addModuleStringConfig(sds name, sds alias, int flags, void *privdata, sds default_val);
+void addModuleEnumConfig(sds name, sds alias, int flags, void *privdata, int default_val, configEnum *enum_vals, int num_enum_vals);
+void addModuleNumericConfig(sds name, sds alias, int flags, void *privdata, long long default_val, int conf_flags, long long lower, long long upper);
 void addModuleConfigApply(list *module_configs, ModuleConfig *module_config);
 int moduleConfigApplyConfig(list *module_configs, const char **err, const char **err_arg_name);
 int getModuleBoolConfig(ModuleConfig *module_config);
@@ -3363,6 +3364,7 @@ long long getModuleNumericConfig(ModuleConfig *module_config);
 int setModuleNumericConfig(ModuleConfig *config, long long val, const char **err);
 
 /* db.c -- Keyspace access API */
+void updateKeysizesHist(redisDb *db, int didx, uint32_t type, uint64_t oldLen, uint64_t newLen);
 int removeExpire(redisDb *db, robj *key);
 void deleteExpiredKeyAndPropagate(redisDb *db, robj *keyobj);
 void deleteEvictedKeyAndPropagate(redisDb *db, robj *keyobj, long long *key_mem_freed);
@@ -3511,9 +3513,9 @@ int ldbIsEnabled(void);
 void ldbLog(sds entry);
 void ldbLogRedisReply(char *reply);
 void sha1hex(char *digest, char *script, size_t len);
-unsigned long evalMemory(void);
+unsigned long evalScriptsMemoryVM(void);
 dict* evalScriptsDict(void);
-unsigned long evalScriptsMemory(void);
+unsigned long evalScriptsMemoryEngine(void);
 uint64_t evalGetCommandFlags(client *c, uint64_t orig_flags);
 uint64_t fcallGetCommandFlags(client *c, uint64_t orig_flags);
 int isInsideYieldingLongCommand(void);
@@ -3775,6 +3777,7 @@ void configGetCommand(client *c);
 void configResetStatCommand(client *c);
 void configRewriteCommand(client *c);
 void configHelpCommand(client *c);
+int configExists(const sds name);
 void hincrbyCommand(client *c);
 void hincrbyfloatCommand(client *c);
 void subscribeCommand(client *c);
