@@ -2,14 +2,16 @@
  * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Licensed under your choice of the Redis Source Available License 2.0
- * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include "server.h"
 #include "bio.h"
 #include "rio.h"
 #include "functions.h"
+#include "cluster_asm.h"
 
 #include <signal.h>
 #include <fcntl.h>
@@ -29,6 +31,13 @@ int rewriteAppendOnlyFile(char *filename);
 aofManifest *aofLoadManifestFromFile(sds am_filepath);
 void aofManifestFreeAndUpdate(aofManifest *am);
 void aof_background_fsync_and_close(int fd);
+
+/* When we call 'startAppendOnly', we will create a temp INCR AOF, and rename
+ * it to the real INCR AOF name when the AOFRW is done, so if want to know the
+ * accurate start offset of the INCR AOF, we need to record it when we create
+ * the temp INCR AOF. This variable is used to record the start offset, and
+ * set the start offset of the real INCR AOF when the AOFRW is done. */
+static long long tempIncAofStartReplOffset = 0;
 
 /* ----------------------------------------------------------------------------
  * AOF Manifest file implementation.
@@ -73,10 +82,15 @@ void aof_background_fsync_and_close(int fd);
 #define AOF_MANIFEST_KEY_FILE_NAME   "file"
 #define AOF_MANIFEST_KEY_FILE_SEQ    "seq"
 #define AOF_MANIFEST_KEY_FILE_TYPE   "type"
+#define AOF_MANIFEST_KEY_FILE_STARTOFFSET "startoffset"
+#define AOF_MANIFEST_KEY_FILE_ENDOFFSET   "endoffset"
 
 /* Create an empty aofInfo. */
 aofInfo *aofInfoCreate(void) {
-    return zcalloc(sizeof(aofInfo));
+    aofInfo *ai = zcalloc(sizeof(aofInfo));
+    ai->start_offset = -1;
+    ai->end_offset = -1;
+    return ai;
 }
 
 /* Free the aofInfo structure (pointed to by ai) and its embedded file_name. */
@@ -93,6 +107,8 @@ aofInfo *aofInfoDup(aofInfo *orig) {
     ai->file_name = sdsdup(orig->file_name);
     ai->file_seq = orig->file_seq;
     ai->file_type = orig->file_type;
+    ai->start_offset = orig->start_offset;
+    ai->end_offset = orig->end_offset;
     return ai;
 }
 
@@ -105,10 +121,19 @@ sds aofInfoFormat(sds buf, aofInfo *ai) {
     if (sdsneedsrepr(ai->file_name))
         filename_repr = sdscatrepr(sdsempty(), ai->file_name, sdslen(ai->file_name));
 
-    sds ret = sdscatprintf(buf, "%s %s %s %lld %s %c\n",
+    sds ret = sdscatprintf(buf, "%s %s %s %lld %s %c",
         AOF_MANIFEST_KEY_FILE_NAME, filename_repr ? filename_repr : ai->file_name,
         AOF_MANIFEST_KEY_FILE_SEQ, ai->file_seq,
         AOF_MANIFEST_KEY_FILE_TYPE, ai->file_type);
+
+    if (ai->start_offset != -1) {
+        ret = sdscatprintf(ret, " %s %lld", AOF_MANIFEST_KEY_FILE_STARTOFFSET, ai->start_offset);
+        if (ai->end_offset != -1) {
+            ret = sdscatprintf(ret, " %s %lld", AOF_MANIFEST_KEY_FILE_ENDOFFSET, ai->end_offset);
+        }
+    }
+
+    ret = sdscatlen(ret, "\n", 1);
     sdsfree(filename_repr);
 
     return ret;
@@ -155,6 +180,19 @@ sds getTempAofManifestFileName(void) {
                 server.aof_filename, MANIFEST_NAME_SUFFIX);
 }
 
+sds appendAofInfoFromList(sds buf, list *aofList) {
+    listNode *ln;
+    listIter li;
+
+    listRewind(aofList, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        aofInfo *ai = (aofInfo*)ln->value;
+        buf = aofInfoFormat(buf, ai);
+    }
+
+    return buf;
+}
+
 /* Returns the string representation of aofManifest pointed to by am.
  *
  * The string is multiple lines separated by '\n', and each line represents
@@ -174,8 +212,6 @@ sds getAofManifestAsString(aofManifest *am) {
     serverAssert(am != NULL);
 
     sds buf = sdsempty();
-    listNode *ln;
-    listIter li;
 
     /* 1. Add BASE File information, it is always at the beginning
      * of the manifest file. */
@@ -184,18 +220,10 @@ sds getAofManifestAsString(aofManifest *am) {
     }
 
     /* 2. Add HISTORY type AOF information. */
-    listRewind(am->history_aof_list, &li);
-    while ((ln = listNext(&li)) != NULL) {
-        aofInfo *ai = (aofInfo*)ln->value;
-        buf = aofInfoFormat(buf, ai);
-    }
+    buf = appendAofInfoFromList(buf, am->history_aof_list);
 
     /* 3. Add INCR type AOF information. */
-    listRewind(am->incr_aof_list, &li);
-    while ((ln = listNext(&li)) != NULL) {
-        aofInfo *ai = (aofInfo*)ln->value;
-        buf = aofInfoFormat(buf, ai);
-    }
+    buf = appendAofInfoFromList(buf, am->incr_aof_list);
 
     return buf;
 }
@@ -304,6 +332,10 @@ aofManifest *aofLoadManifestFromFile(sds am_filepath) {
                 ai->file_seq = atoll(argv[i+1]);
             } else if (!strcasecmp(argv[i], AOF_MANIFEST_KEY_FILE_TYPE)) {
                 ai->file_type = (argv[i+1])[0];
+            } else if (!strcasecmp(argv[i], AOF_MANIFEST_KEY_FILE_STARTOFFSET)) {
+                ai->start_offset = atoll(argv[i+1]);
+            } else if (!strcasecmp(argv[i], AOF_MANIFEST_KEY_FILE_ENDOFFSET)) {
+                ai->end_offset = atoll(argv[i+1]);
             }
             /* else if (!strcasecmp(argv[i], AOF_MANIFEST_KEY_OTHER)) {} */
         }
@@ -433,12 +465,13 @@ sds getNewBaseFileNameAndMarkPreAsHistory(aofManifest *am) {
  * for example:
  *  appendonly.aof.1.incr.aof
  */
-sds getNewIncrAofName(aofManifest *am) {
+sds getNewIncrAofName(aofManifest *am, long long start_reploff) {
     aofInfo *ai = aofInfoCreate();
     ai->file_type = AOF_FILE_TYPE_INCR;
     ai->file_name = sdscatprintf(sdsempty(), "%s.%lld%s%s", server.aof_filename,
                         ++am->curr_incr_file_seq, INCR_FILE_SUFFIX, AOF_FORMAT_SUFFIX);
     ai->file_seq = am->curr_incr_file_seq;
+    ai->start_offset = start_reploff;
     listAddNodeTail(am->incr_aof_list, ai);
     am->dirty = 1;
     return ai->file_name;
@@ -456,7 +489,7 @@ sds getLastIncrAofName(aofManifest *am) {
 
     /* If 'incr_aof_list' is empty, just create a new one. */
     if (!listLength(am->incr_aof_list)) {
-        return getNewIncrAofName(am);
+        return getNewIncrAofName(am, server.master_repl_offset);
     }
 
     /* Or return the last one. */
@@ -781,10 +814,11 @@ int openNewIncrAofForAppend(void) {
     if (server.aof_state == AOF_WAIT_REWRITE) {
         /* Use a temporary INCR AOF file to accumulate data during AOF_WAIT_REWRITE. */
         new_aof_name = getTempIncrAofName();
+        tempIncAofStartReplOffset = server.master_repl_offset;
     } else {
         /* Dup a temp aof_manifest to modify. */
         temp_am = aofManifestDup(server.aof_manifest);
-        new_aof_name = sdsdup(getNewIncrAofName(temp_am));
+        new_aof_name = sdsdup(getNewIncrAofName(temp_am, server.master_repl_offset));
     }
     sds new_aof_filepath = makePath(server.aof_dirname, new_aof_name);
     newfd = open(new_aof_filepath, O_WRONLY|O_TRUNC|O_CREAT, 0644);
@@ -831,6 +865,50 @@ cleanup:
     if (newfd != -1) close(newfd);
     if (temp_am) aofManifestFree(temp_am);
     return C_ERR;
+}
+
+/* When we close gracefully the AOF file, we have the chance to persist the
+ * end replication offset of current INCR AOF. */
+void updateCurIncrAofEndOffset(void) {
+    if (server.aof_state != AOF_ON) return;
+    serverAssert(server.aof_manifest != NULL);
+
+    if (listLength(server.aof_manifest->incr_aof_list) == 0) return;
+    aofInfo *ai = listNodeValue(listLast(server.aof_manifest->incr_aof_list));
+    ai->end_offset = server.master_repl_offset;
+    server.aof_manifest->dirty = 1;
+    /* It doesn't matter if the persistence fails since this information is not
+     * critical, we can get an approximate value by start offset plus file size. */
+    persistAofManifest(server.aof_manifest);
+}
+
+/* After loading AOF data, we need to update the `server.master_repl_offset`
+ * based on the information of the last INCR AOF, to avoid the rollback of
+ * the start offset of new INCR AOF. */
+void updateReplOffsetAndResetEndOffset(void) {
+    if (server.aof_state != AOF_ON) return;
+    serverAssert(server.aof_manifest != NULL);
+
+    /* If the INCR file has an end offset, we directly use it, and clear it
+     * to avoid the next time we load the manifest file, we will use the same
+     * offset, but the real offset may have advanced. */
+    if (listLength(server.aof_manifest->incr_aof_list) == 0) return;
+    aofInfo *ai = listNodeValue(listLast(server.aof_manifest->incr_aof_list));
+    if (ai->end_offset != -1) {
+        server.master_repl_offset = ai->end_offset;
+        ai->end_offset = -1;
+        server.aof_manifest->dirty = 1;
+        /* We must update the end offset of INCR file correctly, otherwise we
+         * may keep wrong information in the manifest file, since we continue
+         * to append data to the same INCR file. */
+        if (persistAofManifest(server.aof_manifest) != AOF_OK)
+            exit(1);
+    } else {
+        /* If the INCR file doesn't have an end offset, we need to calculate
+         * the replication offset by the start offset plus the file size. */
+        server.master_repl_offset = (ai->start_offset == -1 ? 0 : ai->start_offset) +
+                                    getAppendOnlyFileSize(ai->file_name, NULL);
+    }
 }
 
 /* Whether to limit the execution of Background AOF rewrite.
@@ -938,6 +1016,7 @@ void stopAppendOnly(void) {
         server.aof_last_fsync = server.mstime;
     }
     close(server.aof_fd);
+    updateCurIncrAofEndOffset();
 
     server.aof_fd = -1;
     server.aof_selected_db = -1;
@@ -1071,35 +1150,34 @@ void flushAppendOnlyFile(int force) {
     mstime_t latency;
 
     if (sdslen(server.aof_buf) == 0) {
-        /* Check if we need to do fsync even the aof buffer is empty,
-         * because previously in AOF_FSYNC_EVERYSEC mode, fsync is
-         * called only when aof buffer is not empty, so if users
-         * stop write commands before fsync called in one second,
-         * the data in page cache cannot be flushed in time. */
-        if (server.aof_fsync == AOF_FSYNC_EVERYSEC &&
-            server.aof_last_incr_fsync_offset != server.aof_last_incr_size &&
-            server.mstime - server.aof_last_fsync >= 1000 &&
-            !(sync_in_progress = aofFsyncInProgress())) {
-            goto try_fsync;
-
-        /* Check if we need to do fsync even the aof buffer is empty,
-         * the reason is described in the previous AOF_FSYNC_EVERYSEC block,
-         * and AOF_FSYNC_ALWAYS is also checked here to handle a case where
-         * aof_fsync is changed from everysec to always. */
-        } else if (server.aof_fsync == AOF_FSYNC_ALWAYS &&
-                   server.aof_last_incr_fsync_offset != server.aof_last_incr_size)
-        {
-            goto try_fsync;
-        } else {
+        if (server.aof_last_incr_fsync_offset == server.aof_last_incr_size) {
             /* All data is fsync'd already: Update fsynced_reploff_pending just in case.
-             * This is needed to avoid a WAITAOF hang in case a module used RM_Call with the NO_AOF flag,
-             * in which case master_repl_offset will increase but fsynced_reploff_pending won't be updated
-             * (because there's no reason, from the AOF POV, to call fsync) and then WAITAOF may wait on
-             * the higher offset (which contains data that was only propagated to replicas, and not to AOF) */
-            if (!sync_in_progress && server.aof_fsync != AOF_FSYNC_NO)
+             * This is needed to avoid a WAITAOF hang in case a module used RM_Call
+             * with the NO_AOF flag, in which case master_repl_offset will increase but
+             * fsynced_reploff_pending won't be updated (because there's no reason, from
+             * the AOF POV, to call fsync) and then WAITAOF may wait on the higher offset
+             * (which contains data that was only propagated to replicas, and not to AOF) */
+            if (!aofFsyncInProgress())
                 atomicSet(server.fsynced_reploff_pending, server.master_repl_offset);
-            return;
+        } else {
+            /* Check if we need to do fsync even the aof buffer is empty,
+             * because previously in AOF_FSYNC_EVERYSEC mode, fsync is
+             * called only when aof buffer is not empty, so if users
+             * stop write commands before fsync called in one second,
+             * the data in page cache cannot be flushed in time. */
+            if (server.aof_fsync == AOF_FSYNC_EVERYSEC &&
+                server.mstime - server.aof_last_fsync >= 1000 &&
+                !(sync_in_progress = aofFsyncInProgress()))
+                goto try_fsync;
+
+            /* Check if we need to do fsync even the aof buffer is empty,
+             * the reason is described in the previous AOF_FSYNC_EVERYSEC block,
+             * and AOF_FSYNC_ALWAYS is also checked here to handle a case where
+             * aof_fsync is changed from everysec to always. */
+            if (server.aof_fsync == AOF_FSYNC_ALWAYS)
+                goto try_fsync;
         }
+        return;
     }
 
     if (server.aof_fsync == AOF_FSYNC_EVERYSEC)
@@ -1397,6 +1475,29 @@ struct client *createAOFClient(void) {
     return c;
 }
 
+static int truncateAppendOnlyFile(char *filename, off_t valid_up_to) {
+    if (valid_up_to == -1) {
+        serverLog(LL_WARNING,"Last valid command offset is invalid");
+        return 0;
+    }
+
+    if (truncate(filename, valid_up_to) == -1) {
+        serverLog(LL_WARNING,"Error truncating the AOF file %s: %s",
+            filename, strerror(errno));
+        return 0;
+    }
+
+    /* Make sure the AOF file descriptor points to the end of the
+     * file after the truncate call. */
+    if (server.aof_fd != -1 && lseek(server.aof_fd, 0, SEEK_END) == -1) {
+        serverLog(LL_WARNING,"Can't seek the end of the AOF file %s: %s",
+            filename, strerror(errno));
+        return 0;
+    }
+
+    return 1; /* Success */
+}
+
 /* Replay an append log file. On success AOF_OK or AOF_TRUNCATED is returned,
  * otherwise, one of the following is returned:
  * AOF_OPEN_ERR: Failed to open the AOF file.
@@ -1563,12 +1664,24 @@ int loadSingleAppendOnlyFile(char *filename) {
         if (fakeClient->flags & CLIENT_MULTI &&
             fakeClient->cmd->proc != execCommand)
         {
+            /* queueMultiCommand requires a pendingCommand, so we create a "fake" one here
+             * for it to consume */
+            pendingCommand *pcmd = zmalloc(sizeof(pendingCommand));
+            initPendingCommand(pcmd);
+            addPendingCommand(&fakeClient->pending_cmds, pcmd);
+
+            pcmd->argc = argc;
+            pcmd->argv_len = argc;
+            pcmd->argv = argv;
+            pcmd->cmd = cmd;
+
             /* Note: we don't have to attempt calling evalGetCommandFlags,
              * since this is AOF, the checks in processCommand are not made
              * anyway.*/
             queueMultiCommand(fakeClient, cmd->flags);
         } else {
             cmd->proc(fakeClient);
+            fakeClient->all_argv_len_sum = 0; /* Otherwise no one cleans this up and we reach cleanup with it non-zero */
         }
 
         /* The fake client should not have a reply */
@@ -1581,7 +1694,7 @@ int loadSingleAppendOnlyFile(char *filename) {
         /* Clean up. Command code may have changed argv/argc so we use the
          * argv/argc of the client instead of the local variables. */
         freeClientArgv(fakeClient);
-        if (server.aof_load_truncated) valid_up_to = ftello(fp);
+        if (server.aof_load_truncated || server.aof_load_corrupt_tail_max_size) valid_up_to = ftello(fp);
         if (server.key_load_delay)
             debugDelay(server.key_load_delay);
     }
@@ -1614,25 +1727,10 @@ uxeof: /* Unexpected AOF end of file. */
         serverLog(LL_WARNING,"!!! Warning: short read while loading the AOF file %s!!!", filename);
         serverLog(LL_WARNING,"!!! Truncating the AOF %s at offset %llu !!!",
             filename, (unsigned long long) valid_up_to);
-        if (valid_up_to == -1 || truncate(aof_filepath,valid_up_to) == -1) {
-            if (valid_up_to == -1) {
-                serverLog(LL_WARNING,"Last valid command offset is invalid");
-            } else {
-                serverLog(LL_WARNING,"Error truncating the AOF file %s: %s",
-                    filename, strerror(errno));
-            }
-        } else {
-            /* Make sure the AOF file descriptor points to the end of the
-             * file after the truncate call. */
-            if (server.aof_fd != -1 && lseek(server.aof_fd,0,SEEK_END) == -1) {
-                serverLog(LL_WARNING,"Can't seek the end of the AOF file %s: %s",
-                    filename, strerror(errno));
-            } else {
-                serverLog(LL_WARNING,
-                    "AOF %s loaded anyway because aof-load-truncated is enabled", filename);
-                ret = AOF_TRUNCATED;
-                goto loaded_ok;
-            }
+        if (truncateAppendOnlyFile(aof_filepath, valid_up_to)) {
+            serverLog(LL_WARNING, "AOF %s loaded anyway because aof-load-truncated is enabled", aof_filepath);
+            ret = AOF_TRUNCATED;
+            goto loaded_ok;
         }
     }
     serverLog(LL_WARNING, "Unexpected end of file reading the append only file %s. You can: "
@@ -1642,8 +1740,22 @@ uxeof: /* Unexpected AOF end of file. */
     goto cleanup;
 
 fmterr: /* Format error. */
-    serverLog(LL_WARNING, "Bad file format reading the append only file %s: "
-        "make a backup of your AOF file, then use ./redis-check-aof --fix <filename.manifest>", filename);
+    /* fmterr may be caused by accidentally machine shutdown, so if the broken tail
+     * is less than a specified size, try to recover it automatically */
+    if (server.aof_load_corrupt_tail_max_size && sb.st_size - valid_up_to < server.aof_load_corrupt_tail_max_size) {
+        serverLog(LL_WARNING,"!!! Warning: corrupt AOF file tail!!!");
+        serverLog(LL_WARNING,"!!! Truncating the AOF %s at offset %llu (remaining %llu) !!!",
+            aof_filepath, (unsigned long long) valid_up_to, (unsigned long long) sb.st_size - valid_up_to);
+        if (truncateAppendOnlyFile(aof_filepath, valid_up_to)) {
+            serverLog(LL_WARNING, "AOF %s loaded anyway because aof-load-corrupt-tail-max-size is enabled", aof_filepath);
+            ret = AOF_BROKEN_RECOVERED;
+            goto loaded_ok;
+        }
+    }
+    serverLog(LL_WARNING, "Bad file format reading the append only file %s at offset %llu. \
+         make a backup of your AOF file, then use ./redis-check-aof --fix <filename.manifest>. \
+         Alternatively you can set the 'aof-load-corrupt-tail-max-size' configuration option to %llu and restart the server.",
+         aof_filepath, (unsigned long long)valid_up_to, (unsigned long long) sb.st_size - valid_up_to);
     ret = AOF_FAILED;
     /* fall through to cleanup. */
 
@@ -1651,7 +1763,10 @@ cleanup:
     if (fakeClient) freeClient(fakeClient);
     server.current_client = old_cur_client;
     server.executing_client = old_exec_client;
+    int fd = dup(fileno(fp));
     fclose(fp);
+    /* Reclaim page cache memory used by the AOF file in background. */
+    if (fd >= 0) bioCreateCloseJob(fd, 0, 1);
     sdsfree(aof_filepath);
     return ret;
 }
@@ -1714,13 +1829,13 @@ int loadAppendOnlyFiles(aofManifest *am) {
         last_file = ++aof_num == total_num;
         start = ustime();
         ret = loadSingleAppendOnlyFile(aof_name);
-        if (ret == AOF_OK || (ret == AOF_TRUNCATED && last_file)) {
+        if (ret == AOF_OK || ((ret == AOF_TRUNCATED || ret == AOF_BROKEN_RECOVERED) && last_file)) {
             serverLog(LL_NOTICE, "DB loaded from base file %s: %.3f seconds",
                 aof_name, (float)(ustime()-start)/1000000);
         }
 
         /* If the truncated file is not the last file, we consider this to be a fatal error. */
-        if (ret == AOF_TRUNCATED && !last_file) {
+        if ((ret == AOF_TRUNCATED || ret == AOF_BROKEN_RECOVERED) && !last_file) {
             ret = AOF_FAILED;
             serverLog(LL_WARNING, "Fatal error: the truncated file is not the last file");
         }
@@ -1744,7 +1859,7 @@ int loadAppendOnlyFiles(aofManifest *am) {
             last_file = ++aof_num == total_num;
             start = ustime();
             ret = loadSingleAppendOnlyFile(aof_name);
-            if (ret == AOF_OK || (ret == AOF_TRUNCATED && last_file)) {
+            if (ret == AOF_OK || ((ret == AOF_TRUNCATED || ret == AOF_BROKEN_RECOVERED) && last_file)) {
                 serverLog(LL_NOTICE, "DB loaded from incr file %s: %.3f seconds",
                     aof_name, (float)(ustime()-start)/1000000);
             }
@@ -1754,7 +1869,7 @@ int loadAppendOnlyFiles(aofManifest *am) {
             if (ret == AOF_EMPTY) ret = AOF_OK;
 
             /* If the truncated file is not the last file, we consider this to be a fatal error. */
-            if (ret == AOF_TRUNCATED && !last_file) {
+            if ((ret == AOF_TRUNCATED || ret == AOF_BROKEN_RECOVERED) && !last_file) {
                 ret = AOF_FAILED;
                 serverLog(LL_WARNING, "Fatal error: the truncated file is not the last file");
             }
@@ -1920,10 +2035,11 @@ int rewriteSortedSetObject(rio *r, robj *key, robj *o) {
         }
     } else if (o->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = o->ptr;
-        dictIterator *di = dictGetIterator(zs->dict);
+        dictIterator di;
         dictEntry *de;
 
-        while((de = dictNext(di)) != NULL) {
+        dictInitIterator(&di, zs->dict);
+        while((de = dictNext(&di)) != NULL) {
             sds ele = dictGetKey(de);
             double *score = dictGetVal(de);
 
@@ -1935,20 +2051,20 @@ int rewriteSortedSetObject(rio *r, robj *key, robj *o) {
                     !rioWriteBulkString(r,"ZADD",4) ||
                     !rioWriteBulkObject(r,key)) 
                 {
-                    dictReleaseIterator(di);
+                    dictResetIterator(&di);
                     return 0;
                 }
             }
             if (!rioWriteBulkDouble(r,*score) ||
                 !rioWriteBulkString(r,ele,sdslen(ele)))
             {
-                dictReleaseIterator(di);
+                dictResetIterator(&di);
                 return 0;
             }
             if (++count == AOF_REWRITE_ITEMS_PER_CMD) count = 0;
             items--;
         }
-        dictReleaseIterator(di);
+        dictResetIterator(&di);
     } else {
         serverPanic("Unknown sorted zset encoding");
     }
@@ -2252,21 +2368,58 @@ int rewriteModuleObject(rio *r, robj *key, robj *o, int dbid) {
 
 static int rewriteFunctions(rio *aof) {
     dict *functions = functionsLibGet();
-    dictIterator *iter = dictGetIterator(functions);
+    dictIterator iter;
     dictEntry *entry = NULL;
-    while ((entry = dictNext(iter))) {
+    dictInitIterator(&iter, functions);
+    while ((entry = dictNext(&iter))) {
         functionLibInfo *li = dictGetVal(entry);
         if (rioWrite(aof, "*3\r\n", 4) == 0) goto werr;
         char function_load[] = "$8\r\nFUNCTION\r\n$4\r\nLOAD\r\n";
         if (rioWrite(aof, function_load, sizeof(function_load) - 1) == 0) goto werr;
         if (rioWriteBulkString(aof, li->code, sdslen(li->code)) == 0) goto werr;
     }
-    dictReleaseIterator(iter);
+    dictResetIterator(&iter);
     return 1;
 
 werr:
-    dictReleaseIterator(iter);
+    dictResetIterator(&iter);
     return 0;
+}
+
+int rewriteObject(rio *r, robj *key, robj *o, int dbid, long long expiretime) {
+    /* Save the key and associated value */
+    if (o->type == OBJ_STRING) {
+        /* Emit a SET command */
+        static const char cmd[]="*3\r\n$3\r\nSET\r\n";
+        if (rioWrite(r,cmd,sizeof(cmd)-1) == 0) return C_ERR;
+        /* Key and value */
+        if (rioWriteBulkObject(r,key) == 0) return C_ERR;
+        if (rioWriteBulkObject(r,o) == 0) return C_ERR;
+    } else if (o->type == OBJ_LIST) {
+        if (rewriteListObject(r,key,o) == 0) return C_ERR;
+    } else if (o->type == OBJ_SET) {
+        if (rewriteSetObject(r,key,o) == 0) return C_ERR;
+    } else if (o->type == OBJ_ZSET) {
+        if (rewriteSortedSetObject(r,key,o) == 0) return C_ERR;
+    } else if (o->type == OBJ_HASH) {
+        if (rewriteHashObject(r,key,o) == 0) return C_ERR;
+    } else if (o->type == OBJ_STREAM) {
+        if (rewriteStreamObject(r,key,o) == 0) return C_ERR;
+    } else if (o->type == OBJ_MODULE) {
+        if (rewriteModuleObject(r,key,o,dbid) == 0) return C_ERR;
+    } else {
+        serverPanic("Unknown object type");
+    }
+
+    /* Save the expire time */
+    if (expiretime != -1) {
+        static const char cmd[]="*3\r\n$9\r\nPEXPIREAT\r\n";
+        if (rioWrite(r,cmd,sizeof(cmd)-1) == 0) return C_ERR;
+        if (rioWriteBulkObject(r,key) == 0) return C_ERR;
+        if (rioWriteBulkLongLong(r,expiretime) == 0) return C_ERR;
+    }
+
+    return C_OK;
 }
 
 int rewriteAppendOnlyFileRio(rio *aof) {
@@ -2274,6 +2427,7 @@ int rewriteAppendOnlyFileRio(rio *aof) {
     int j;
     long key_count = 0;
     long long updated_time = 0;
+    unsigned long long skipped = 0;
     kvstoreIterator *kvs_it = NULL;
 
     /* Record timestamp at the beginning of rewriting AOF. */
@@ -2297,54 +2451,35 @@ int rewriteAppendOnlyFileRio(rio *aof) {
         kvs_it = kvstoreIteratorInit(db->keys);
         /* Iterate this DB writing every entry */
         while((de = kvstoreIteratorNext(kvs_it)) != NULL) {
-            sds keystr;
-            robj key, *o;
             long long expiretime;
             size_t aof_bytes_before_key = aof->processed_bytes;
 
-            keystr = dictGetKey(de);
-            o = dictGetVal(de);
-            initStaticStringObject(key,keystr);
+            /* Get the value object (of type kvobj) */
+            kvobj *o = dictGetKV(de);
+            
+            /* Get the expire time */
+            expiretime = kvobjGetExpire(o);
 
-            expiretime = getExpire(db,&key);
-
-            /* Save the key and associated value */
-            if (o->type == OBJ_STRING) {
-                /* Emit a SET command */
-                char cmd[]="*3\r\n$3\r\nSET\r\n";
-                if (rioWrite(aof,cmd,sizeof(cmd)-1) == 0) goto werr;
-                /* Key and value */
-                if (rioWriteBulkObject(aof,&key) == 0) goto werr;
-                if (rioWriteBulkObject(aof,o) == 0) goto werr;
-            } else if (o->type == OBJ_LIST) {
-                if (rewriteListObject(aof,&key,o) == 0) goto werr;
-            } else if (o->type == OBJ_SET) {
-                if (rewriteSetObject(aof,&key,o) == 0) goto werr;
-            } else if (o->type == OBJ_ZSET) {
-                if (rewriteSortedSetObject(aof,&key,o) == 0) goto werr;
-            } else if (o->type == OBJ_HASH) {
-                if (rewriteHashObject(aof,&key,o) == 0) goto werr;
-            } else if (o->type == OBJ_STREAM) {
-                if (rewriteStreamObject(aof,&key,o) == 0) goto werr;
-            } else if (o->type == OBJ_MODULE) {
-                if (rewriteModuleObject(aof,&key,o,j) == 0) goto werr;
-            } else {
-                serverPanic("Unknown object type");
+            /* Skip keys that are being trimmed */
+            if (server.cluster_enabled) {
+                int curr_slot = kvstoreIteratorGetCurrentDictIndex(kvs_it);
+                if (isSlotInTrimJob(curr_slot)) {
+                    skipped++;
+                    continue;
+                }
             }
+            
+            /* Set on stack string object for key */
+            robj key;
+            initStaticStringObject(key, kvobjGetKey(o));
+
+            if (rewriteObject(aof, &key, o, j, expiretime) == C_ERR) goto werr;
 
             /* In fork child process, we can try to release memory back to the
              * OS and possibly avoid or decrease COW. We give the dismiss
              * mechanism a hint about an estimated size of the object we stored. */
             size_t dump_size = aof->processed_bytes - aof_bytes_before_key;
             if (server.in_fork_child) dismissObject(o, dump_size);
-
-            /* Save the expire time */
-            if (expiretime != -1) {
-                char cmd[]="*3\r\n$9\r\nPEXPIREAT\r\n";
-                if (rioWrite(aof,cmd,sizeof(cmd)-1) == 0) goto werr;
-                if (rioWriteBulkObject(aof,&key) == 0) goto werr;
-                if (rioWriteBulkLongLong(aof,expiretime) == 0) goto werr;
-            }
 
             /* Update info every 1 second (approximately).
              * in order to avoid calling mstime() on each iteration, we will
@@ -2363,6 +2498,7 @@ int rewriteAppendOnlyFileRio(rio *aof) {
         }
         kvstoreIteratorRelease(kvs_it);
     }
+    serverLog(LL_NOTICE, "AOF rewrite done, %ld keys saved, %llu keys skipped.", key_count, skipped);
     return C_OK;
 
 werr:
@@ -2505,9 +2641,9 @@ int rewriteAppendOnlyFileBackground(void) {
             serverLog(LL_NOTICE,
                 "Successfully created the temporary AOF base file %s", tmpfile);
             sendChildCowInfo(CHILD_INFO_TYPE_AOF_COW_SIZE, "AOF rewrite");
-            exitFromChild(0);
+            exitFromChild(0, 0);
         } else {
-            exitFromChild(1);
+            exitFromChild(1, 0);
         }
     } else {
         /* Parent */
@@ -2665,7 +2801,7 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
             sds temp_incr_aof_name = getTempIncrAofName();
             sds temp_incr_filepath = makePath(server.aof_dirname, temp_incr_aof_name);
             /* Get next new incr aof name. */
-            sds new_incr_filename = getNewIncrAofName(temp_am);
+            sds new_incr_filename = getNewIncrAofName(temp_am, tempIncAofStartReplOffset);
             new_incr_filepath = makePath(server.aof_dirname, new_incr_filename);
             latencyStartMonitor(latency);
             if (rename(temp_incr_filepath, new_incr_filepath) == -1) {

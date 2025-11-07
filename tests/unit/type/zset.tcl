@@ -308,10 +308,28 @@ start_server {tags {"zset"}} {
             assert_error "*NaN*" {r zincrby myzset -inf abc}
         }
 
+        test "ZINCRBY accepts hexadecimal inputs - $encoding" {
+            r del zhexa
+
+            # Add some hexadecimal values to the sorted set 'zhexa'
+            r zadd zhexa 0x0p+0 "zero"
+            r zadd zhexa 0x1p+0 "one"
+
+            # Increment them
+            # 0 + 0 = 0
+            r zincrby zhexa 0x0p+0 "zero"
+            # 1 + 1 = 2
+            r zincrby zhexa 0x1p+0 "one"
+
+            assert_equal 0 [r zscore zhexa "zero"]
+            assert_equal 2 [r zscore zhexa "one"]
+        }
+
         test "ZINCRBY against invalid incr value - $encoding" {
             r del zincr
             r zadd zincr 1 "one"
             assert_error "*value is not a valid*" {r zincrby zincr v "one"}
+            assert_error "*value is not a valid float" {r zincrby zincr 23456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789 "one"}
         }
 
         test "ZADD - Variadic version base case - $encoding" {
@@ -583,20 +601,24 @@ start_server {tags {"zset"}} {
             assert_equal {d e f} [r zrangebyscore zset 0 10 LIMIT 2 3]
             assert_equal {d e f} [r zrangebyscore zset 0 10 LIMIT 2 10]
             assert_equal {}      [r zrangebyscore zset 0 10 LIMIT 20 10]
+            assert_equal {}      [r zrangebyscore zset 0 10 LIMIT -1 2]
             assert_equal {f e}   [r zrevrangebyscore zset 10 0 LIMIT 0 2]
             assert_equal {d c b} [r zrevrangebyscore zset 10 0 LIMIT 2 3]
             assert_equal {d c b} [r zrevrangebyscore zset 10 0 LIMIT 2 10]
             assert_equal {}      [r zrevrangebyscore zset 10 0 LIMIT 20 10]
+            assert_equal {}      [r zrevrangebyscore zset 10 0 LIMIT -1 2]
             # zrangebyscore uses different logic when offset > ZSKIPLIST_MAX_SEARCH
             create_long_zset zset 30
             assert_equal {i12 i13 i14} [r zrangebyscore zset 0 20 LIMIT 12 3]
             assert_equal {i14 i15}     [r zrangebyscore zset 0 20 LIMIT 14 2]
             assert_equal {i19 i20 i21} [r zrangebyscore zset 0 30 LIMIT 19 3]
-            assert_equal {i29}     [r zrangebyscore zset 10 30 LIMIT 19 2]
+            assert_equal {i29}         [r zrangebyscore zset 10 30 LIMIT 19 2]
+            assert_equal {}            [r zrangebyscore zset 0 20 LIMIT -1 3]
             assert_equal {i17 i16 i15} [r zrevrangebyscore zset 30 10 LIMIT 12 3]
             assert_equal {i6 i5}       [r zrevrangebyscore zset 20 0 LIMIT 14 2]
             assert_equal {i2 i1 i0}    [r zrevrangebyscore zset 20 0 LIMIT 18 5]
             assert_equal {i0}          [r zrevrangebyscore zset 20 0 LIMIT 20 5]
+            assert_equal {}            [r zrevrangebyscore zset 30 10 LIMIT -1 3]
         }
 
         test "ZRANGEBYSCORE with LIMIT and WITHSCORES - $encoding" {
@@ -680,9 +702,11 @@ start_server {tags {"zset"}} {
             assert_equal {bar} [r zrangebylex zset \[bar \[down LIMIT 0 1]
             assert_equal {cool} [r zrangebylex zset \[bar \[down LIMIT 1 1]
             assert_equal {bar cool down} [r zrangebylex zset \[bar \[down LIMIT 0 100]
+            assert_equal {} [r zrangebylex zset - \[cool LIMIT -1 2]
             assert_equal {omega hill great foo elephant} [r zrevrangebylex zset + \[d LIMIT 0 5]
             assert_equal {omega hill great foo} [r zrevrangebylex zset + \[d LIMIT 0 4]
             assert_equal {great foo elephant} [r zrevrangebylex zset + \[d LIMIT 2 3]
+            assert_equal {} [r zrevrangebylex zset + \[d LIMIT -1 5]
             # zrangebylex uses different logic when offset > ZSKIPLIST_MAX_SEARCH
             create_long_lex_zset
             assert_equal {max null} [r zrangebylex zset - \[tree LIMIT 12 2]
@@ -692,12 +716,14 @@ start_server {tags {"zset"}} {
             assert_equal {max} [r zrangebylex zset \[max \[null LIMIT 0 1]
             assert_equal {null} [r zrangebylex zset \[max \[null LIMIT 1 1]
             assert_equal {max null omega point} [r zrangebylex zset \[max \[point LIMIT 0 100]
+            assert_equal {} [r zrangebylex zset - \[tree LIMIT -1 2]
             assert_equal {tree sea result query point} [r zrevrangebylex zset + \[o LIMIT 0 5]
             assert_equal {tree sea result query} [r zrevrangebylex zset + \[o LIMIT 0 4]
             assert_equal {omega null max lip} [r zrevrangebylex zset + \[l LIMIT 5 4]
             assert_equal {elephant down} [r zrevrangebylex zset + \[a LIMIT 15 2]
             assert_equal {bar alpha} [r zrevrangebylex zset + - LIMIT 18 6]
             assert_equal {hill great foo} [r zrevrangebylex zset + \[c LIMIT 12 3]
+            assert_equal {} [r zrevrangebylex zset + \[o LIMIT -1 5]
         }
 
         test "ZRANGEBYLEX with invalid lex range specifiers - $encoding" {

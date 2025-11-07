@@ -1,7 +1,7 @@
 set testmodule [file normalize tests/modules/moduleconfigs.so]
 set testmoduletwo [file normalize tests/modules/moduleconfigstwo.so]
 
-start_server {tags {"modules"}} {
+start_server {tags {"modules external:skip"}} {
     r module load $testmodule
     test {Config get commands work} {
         # Make sure config get module config works
@@ -319,10 +319,10 @@ start_server {tags {"modules"}} {
 
         # missing LoadConfigs call
         catch {exec src/redis-server --loadmodule "$testmodule" noload --moduleconfigs.string "hello"} err
-        assert_match {*Module Configurations were not set, likely a missing LoadConfigs call. Unloading the module.*} $err
+        assert_match {*Module Configurations were not set, missing LoadConfigs call. Unloading the module.*} $err
 
         # successful
-        start_server [list overrides [list loadmodule "$testmodule" moduleconfigs.string "bootedup" moduleconfigs.enum two moduleconfigs.flags "two four"]] {
+        start_server [list overrides [list loadmodule "$testmodule" moduleconfigs.string "bootedup" moduleconfigs.enum two moduleconfigs.flags "two four"] tags {"external:skip"}] {
             assert_equal [r config get moduleconfigs.string] "moduleconfigs.string bootedup"
             assert_equal [r config get moduleconfigs.mutable_bool] "moduleconfigs.mutable_bool yes"
             assert_equal [r config get moduleconfigs.immutable_bool] "moduleconfigs.immutable_bool no"
@@ -341,6 +341,46 @@ start_server {tags {"modules"}} {
             assert_equal [r config get unprefix-enum] "unprefix-enum one"
             assert_equal [r config get unprefix-enum-alias] "unprefix-enum-alias one"
         }
+    }
+
+    test {loadmodule CONFIG values take precedence over module loadex ARGS values} {
+        # Load module with conflicting CONFIG and ARGS values
+        r module loadex $testmodule \
+            CONFIG moduleconfigs.string goo \
+            CONFIG moduleconfigs.memory_numeric 2mb \
+            ARGS override-default
+
+        # Verify CONFIG values took precedence over the values that override-default would have caused the module to set
+        assert_equal [r config get moduleconfigs.string] "moduleconfigs.string goo"
+        assert_equal [r config get moduleconfigs.memory_numeric] "moduleconfigs.memory_numeric 2097152"
+
+        r module unload moduleconfigs
+    }
+
+    # Test: Ensure that modified configuration values from ARGS are correctly written to the config file
+    test {Modified ARGS values are persisted after config rewrite when set through CONFIG commands} {
+        # Load module with non-default ARGS values
+        r module loadex $testmodule ARGS override-default
+
+        # Verify the initial values were overwritten
+        assert_equal [r config get moduleconfigs.memory_numeric] "moduleconfigs.memory_numeric 123"
+        assert_equal [r config get moduleconfigs.string] "moduleconfigs.string foo"
+
+        # Set new values to simulate user configuration changes
+        r config set moduleconfigs.memory_numeric 1mb
+        r config set moduleconfigs.string "modified_value"
+
+        # Verify that the changes took effect
+        assert_equal [r config get moduleconfigs.memory_numeric] "moduleconfigs.memory_numeric 1048576"
+        assert_equal [r config get moduleconfigs.string] "moduleconfigs.string modified_value"
+
+        # Perform a config rewrite
+        r config rewrite
+
+        restart_server 0 true false
+        assert_equal [r config get moduleconfigs.memory_numeric] "moduleconfigs.memory_numeric 1048576"
+        assert_equal [r config get moduleconfigs.string] "moduleconfigs.string modified_value"
+        r module unload moduleconfigs
     }
 }
 

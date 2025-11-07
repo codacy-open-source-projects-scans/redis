@@ -1,3 +1,16 @@
+#
+# Copyright (c) 2009-Present, Redis Ltd.
+# All rights reserved.
+#
+# Copyright (c) 2024-present, Valkey contributors.
+# All rights reserved.
+#
+# Licensed under your choice of the Redis Source Available License 2.0
+# (RSALv2) or the Server Side Public License v1 (SSPLv1).
+#
+# Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+#
+
 start_server {tags {"introspection"}} {
     test "PING" {
         assert_equal {PONG} [r ping]
@@ -6,8 +19,13 @@ start_server {tags {"introspection"}} {
     }
 
     test {CLIENT LIST} {
-        r client list
-    } {id=* addr=*:* laddr=*:* fd=* name=* age=* idle=* flags=N db=* sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=26 qbuf-free=* argv-mem=* multi-mem=0 rbs=* rbp=* obl=0 oll=0 omem=0 tot-mem=* events=r cmd=client|list user=* redir=-1 resp=*}
+        set client_list [r client list]
+        if {[lindex [r config get io-threads] 1] == 1} {
+            assert_match {id=* addr=*:* laddr=*:* fd=* name=* age=* idle=* flags=N db=* sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=26 qbuf-free=* argv-mem=* multi-mem=0 rbs=* rbp=* obl=0 oll=0 omem=0 tot-mem=* events=r cmd=client|list user=* redir=-1 resp=* lib-name=* lib-ver=* io-thread=* tot-net-in=* tot-net-out=* tot-cmds=*} $client_list
+        } else {
+            assert_match {id=* addr=*:* laddr=*:* fd=* name=* age=* idle=* flags=N db=* sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=* argv-mem=* multi-mem=0 rbs=* rbp=* obl=0 oll=0 omem=0 tot-mem=* events=r cmd=client|list user=* redir=-1 resp=* lib-name=* lib-ver=* io-thread=* tot-net-in=* tot-net-out=* tot-cmds=*} $client_list
+        }
+    }
 
     test {CLIENT LIST with IDs} {
         set myid [r client id]
@@ -16,8 +34,112 @@ start_server {tags {"introspection"}} {
     }
 
     test {CLIENT INFO} {
-        r client info
-    } {id=* addr=*:* laddr=*:* fd=* name=* age=* idle=* flags=N db=* sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=26 qbuf-free=* argv-mem=* multi-mem=0 rbs=* rbp=* obl=0 oll=0 omem=0 tot-mem=* events=r cmd=client|info user=* redir=-1 resp=*}
+        set client [r client info]
+        if {[lindex [r config get io-threads] 1] == 1} {
+            assert_match {id=* addr=*:* laddr=*:* fd=* name=* age=* idle=* flags=N db=* sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=26 qbuf-free=* argv-mem=* multi-mem=0 rbs=* rbp=* obl=0 oll=0 omem=0 tot-mem=* events=r cmd=client|info user=* redir=-1 resp=* lib-name=* lib-ver=* io-thread=* tot-net-in=* tot-net-out=* tot-cmds=*} $client
+        } else {
+            assert_match {id=* addr=*:* laddr=*:* fd=* name=* age=* idle=* flags=N db=* sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=* argv-mem=* multi-mem=0 rbs=* rbp=* obl=0 oll=0 omem=0 tot-mem=* events=r cmd=client|info user=* redir=-1 resp=* lib-name=* lib-ver=* io-thread=* tot-net-in=* tot-net-out=* tot-cmds=*} $client
+        }
+    } 
+
+    proc get_field_in_client_info {info field} {
+        set info [string trim $info]
+        foreach item [split $info " "] {
+            set kv [split $item "="]
+            set k [lindex $kv 0]
+            if {[string match $field $k]} {
+                return [lindex $kv 1]   
+            }
+        }
+        return ""
+    }
+
+    proc get_field_in_client_list {id client_list filed} {
+        set list [split $client_list "\r\n"]
+        foreach info $list {
+            if {[string match "id=$id *" $info] } {
+                return [get_field_in_client_info $info $filed]
+            }
+        }
+        return ""
+    }
+
+    test {CLIENT INFO input/output/cmds-processed stats} {
+        set info1 [r client info]
+        set input1 [get_field_in_client_info $info1 "tot-net-in"]
+        set output1 [get_field_in_client_info $info1 "tot-net-out"]
+        set cmd1 [get_field_in_client_info $info1 "tot-cmds"]
+
+        # Run a command by that client and test if the stats change correctly
+        set info2 [r client info]
+        set input2 [get_field_in_client_info $info2 "tot-net-in"]
+        set output2 [get_field_in_client_info $info2 "tot-net-out"]
+        set cmd2 [get_field_in_client_info $info2 "tot-cmds"]
+
+        # NOTE if CLIENT INFO changes it's stats the output_bytes here and in the
+        # other related tests will need to be updated.
+        set input_bytes 26 ; # CLIENT INFO request
+        set output_bytes 300 ; # CLIENT INFO result
+        set cmds_processed 1 ; # processed the command CLIENT INFO
+        assert_equal [expr $input1+$input_bytes] $input2
+        assert {[expr $output1+$output_bytes] < $output2}
+        assert_equal [expr $cmd1+$cmds_processed] $cmd2
+    }
+
+    test {CLIENT INFO input/output/cmds-processed stats for blocking command} {
+        r del mylist
+        set rd [redis_deferring_client]
+        $rd client id
+        set rd_id [$rd read]
+ 
+        set info_list [r client list]
+        set input1 [get_field_in_client_list $rd_id $info_list "tot-net-in"]
+        set output1 [get_field_in_client_list $rd_id $info_list "tot-net-out"]
+        set cmd1 [get_field_in_client_list $rd_id $info_list "tot-cmds"]
+        $rd blpop mylist 0
+
+        # Make sure to wait for the $rd client to be blocked
+        wait_for_blocked_client
+
+        # Check if input stats have changed for $rd. Since command is blocking
+        # and has not been unblocked yet we expect no change in output/cmds-processed
+        # stats.
+        set info_list [r client list]
+        set input2 [get_field_in_client_list $rd_id $info_list "tot-net-in"]
+        set output2 [get_field_in_client_list $rd_id $info_list "tot-net-out"]
+        set cmd2 [get_field_in_client_list $rd_id $info_list "tot-cmds"]
+        assert_equal [expr $input1+34] $input2
+        assert_equal $output1 $output2
+        assert_equal $cmd1 $cmd2
+
+        # Unblock the $rd client (which will send a reply and thus update output
+        # and cmd-processed stats).
+        r lpush mylist a
+
+        # Note that the per-client stats are from the POV of the server. The
+        # deferred client may have not read the response yet, but the stats
+        # are still updated.
+        set info_list [r client list]
+        set input3 [get_field_in_client_list $rd_id $info_list "tot-net-in"]
+        set output3 [get_field_in_client_list $rd_id $info_list "tot-net-out"]
+        set cmd3 [get_field_in_client_list $rd_id $info_list "tot-cmds"]
+        assert_equal $input2 $input3
+        assert_equal [expr $output2+23] $output3
+        assert_equal [expr $cmd2+1] $cmd3
+
+        $rd close
+    }
+
+    test {CLIENT INFO cmds-processed stats for recursive command} {
+        set info [r client info]
+        set tot_cmd_before [get_field_in_client_info $info "tot-cmds"]
+        r eval "redis.call('ping')" 0
+        set info [r client info]
+        set tot_cmd_after [get_field_in_client_info $info "tot-cmds"]
+
+        # We executed 3 commands - EVAL, which in turn executed PING and finally CLIENT INFO
+        assert_equal [expr $tot_cmd_before+3] $tot_cmd_after
+    }
 
     test {CLIENT KILL with illegal arguments} {
         assert_error "ERR wrong number of arguments for 'client|kill' command" {r client kill}
@@ -86,6 +208,11 @@ start_server {tags {"introspection"}} {
         assert {$connected_clients >= 3}
         set res [r client kill skipme yes]
         assert {$res == $connected_clients - 1}
+        wait_for_condition 1000 10 {
+            [s connected_clients] eq 1
+        } else {
+            fail "Can't kill all clients except the current one"
+        }
 
         # Kill all clients, including `me`
         set rd3 [redis_deferring_client]
@@ -304,6 +431,9 @@ start_server {tags {"introspection"}} {
         $rd read ; # Discard the OK
         
         $bc blpop mylist 0
+        # make sure the blpop arrives first
+        $bc flush
+        after 100
         wait_for_blocked_clients_count 1
         r lpush mylist 1
         wait_for_blocked_clients_count 0
@@ -430,7 +560,6 @@ start_server {tags {"introspection"}} {
         set skip_configs {
             rdbchecksum
             daemonize
-            io-threads-do-reads
             tcp-backlog
             always-show-logo
             syslog-enabled
@@ -473,6 +602,7 @@ start_server {tags {"introspection"}} {
             socket-mark-id
             req-res-logfile
             client-default-resp
+            vset-force-single-threaded-execution
         }
 
         if {!$::tls} {
@@ -904,3 +1034,62 @@ test {CONFIG REWRITE handles alias config properly} {
         assert_equal [r config get hash-max-listpack-entries] {hash-max-listpack-entries 100}
     }
 } {} {external:skip}
+
+test {IO threads client number} {
+    start_server {overrides {io-threads 2} tags {external:skip}} {
+        set iothread_clients [get_io_thread_clients 1]
+        assert_equal $iothread_clients [s connected_clients]
+        assert_equal [get_io_thread_clients 0] 0
+
+        r script debug yes ; # Transfer to main thread
+        assert_equal [get_io_thread_clients 0] 1
+        assert_equal [get_io_thread_clients 1] [expr $iothread_clients - 1]
+
+        set iothread_clients [get_io_thread_clients 1]
+        set rd1 [redis_deferring_client]
+        set rd2 [redis_deferring_client]
+        assert_equal [get_io_thread_clients 1] [expr $iothread_clients + 2]
+        $rd1 close
+        $rd2 close
+        wait_for_condition 1000 10 {
+            [get_io_thread_clients 1] eq $iothread_clients
+        } else {
+            fail "Fail to close clients of io thread 1"
+        }
+        assert_equal [get_io_thread_clients 0] 1
+
+        r script debug no ; # Transfer to io thread
+        assert_equal [get_io_thread_clients 0] 0
+        assert_equal [get_io_thread_clients 1] [expr $iothread_clients + 1]
+    }
+}
+
+test {Clients are evenly distributed among io threads} {
+    start_server {overrides {io-threads 4} tags {external:skip}} {
+        set cur_clients [s connected_clients]
+        assert_equal $cur_clients 1
+        global rdclients
+        for {set i 1} {$i < 9} {incr i} {
+            set rdclients($i) [redis_deferring_client]
+        }
+        for {set i 1} {$i <= 3} {incr i} {
+            assert_equal [get_io_thread_clients $i] 3
+        }
+
+        $rdclients(3) close
+        $rdclients(4) close
+        wait_for_condition 1000 10 {
+            [get_io_thread_clients 1] eq 2 &&
+            [get_io_thread_clients 2] eq 2 &&
+            [get_io_thread_clients 3] eq 3
+        } else {
+            fail "Fail to close clients"
+        }
+
+        set  $rdclients(3) [redis_deferring_client]
+        set  $rdclients(4) [redis_deferring_client]
+        for {set i 1} {$i <= 3} {incr i} {
+            assert_equal [get_io_thread_clients $i] 3
+        }
+    }
+}

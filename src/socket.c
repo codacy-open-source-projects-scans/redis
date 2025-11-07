@@ -2,8 +2,9 @@
  * Copyright (c) 2019-Present, Redis Ltd.
  * All rights reserved.
  *
- * Licensed under your choice of the Redis Source Available License 2.0
- * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include "server.h"
@@ -53,11 +54,12 @@ static ConnectionType CT_Socket;
  * be embedded in different structs, not just client.
  */
 
-static connection *connCreateSocket(void) {
+static connection *connCreateSocket(struct aeEventLoop *el) {
     connection *conn = zcalloc(sizeof(connection));
     conn->type = &CT_Socket;
     conn->fd = -1;
     conn->iovcnt = IOV_MAX;
+    conn->el = el;
 
     return conn;
 }
@@ -72,9 +74,9 @@ static connection *connCreateSocket(void) {
  * is not in an error state (which is not possible for a socket connection,
  * but could but possible with other protocols).
  */
-static connection *connCreateAcceptedSocket(int fd, void *priv) {
+static connection *connCreateAcceptedSocket(struct aeEventLoop *el, int fd, void *priv) {
     UNUSED(priv);
-    connection *conn = connCreateSocket();
+    connection *conn = connCreateSocket(el);
     conn->fd = fd;
     conn->state = CONN_STATE_ACCEPTING;
     return conn;
@@ -93,7 +95,7 @@ static int connSocketConnect(connection *conn, const char *addr, int port, const
     conn->state = CONN_STATE_CONNECTING;
 
     conn->conn_handler = connect_handler;
-    aeCreateFileEvent(server.el, conn->fd, AE_WRITABLE,
+    aeCreateFileEvent(conn->el, conn->fd, AE_WRITABLE,
             conn->type->ae_handler, conn);
 
     return C_OK;
@@ -114,7 +116,7 @@ static void connSocketShutdown(connection *conn) {
 /* Close the connection and free resources. */
 static void connSocketClose(connection *conn) {
     if (conn->fd != -1) {
-        aeDeleteFileEvent(server.el,conn->fd, AE_READABLE | AE_WRITABLE);
+        if (conn->el) aeDeleteFileEvent(conn->el, conn->fd, AE_READABLE | AE_WRITABLE);
         close(conn->fd);
         conn->fd = -1;
     }
@@ -190,6 +192,15 @@ static int connSocketAccept(connection *conn, ConnectionCallbackFunc accept_hand
     return ret;
 }
 
+/* Rebind the connection to another event loop, read/write handlers must not
+ * be installed in the current event loop, otherwise it will cause two event
+ * loops to manage the same connection at the same time. */
+static int connSocketRebindEventLoop(connection *conn, aeEventLoop *el) {
+    serverAssert(!conn->el && !conn->read_handler && !conn->write_handler);
+    conn->el = el;
+    return C_OK;
+}
+
 /* Register a write handler, to be called when the connection is writable.
  * If NULL, the existing handler is removed.
  *
@@ -207,9 +218,9 @@ static int connSocketSetWriteHandler(connection *conn, ConnectionCallbackFunc fu
     else
         conn->flags &= ~CONN_FLAG_WRITE_BARRIER;
     if (!conn->write_handler)
-        aeDeleteFileEvent(server.el,conn->fd,AE_WRITABLE);
+        aeDeleteFileEvent(conn->el,conn->fd,AE_WRITABLE);
     else
-        if (aeCreateFileEvent(server.el,conn->fd,AE_WRITABLE,
+        if (aeCreateFileEvent(conn->el,conn->fd,AE_WRITABLE,
                     conn->type->ae_handler,conn) == AE_ERR) return C_ERR;
     return C_OK;
 }
@@ -222,9 +233,9 @@ static int connSocketSetReadHandler(connection *conn, ConnectionCallbackFunc fun
 
     conn->read_handler = func;
     if (!conn->read_handler)
-        aeDeleteFileEvent(server.el,conn->fd,AE_READABLE);
+        aeDeleteFileEvent(conn->el,conn->fd,AE_READABLE);
     else
-        if (aeCreateFileEvent(server.el,conn->fd,
+        if (aeCreateFileEvent(conn->el,conn->fd,
                     AE_READABLE,conn->type->ae_handler,conn) == AE_ERR) return C_ERR;
     return C_OK;
 }
@@ -250,7 +261,7 @@ static void connSocketEventHandler(struct aeEventLoop *el, int fd, void *clientD
             conn->state = CONN_STATE_CONNECTED;
         }
 
-        if (!conn->write_handler) aeDeleteFileEvent(server.el,conn->fd,AE_WRITABLE);
+        if (!conn->write_handler) aeDeleteFileEvent(conn->el, conn->fd, AE_WRITABLE);
 
         if (!callHandler(conn, conn->conn_handler)) return;
         conn->conn_handler = NULL;
@@ -291,20 +302,21 @@ static void connSocketAcceptHandler(aeEventLoop *el, int fd, void *privdata, int
     int cport, cfd;
     int max = server.max_new_conns_per_cycle;
     char cip[NET_IP_STR_LEN];
-    UNUSED(el);
     UNUSED(mask);
     UNUSED(privdata);
 
     while(max--) {
         cfd = anetTcpAccept(server.neterr, fd, cip, sizeof(cip), &cport);
         if (cfd == ANET_ERR) {
+            if (anetAcceptFailureNeedsRetry(errno))
+                continue;
             if (errno != EWOULDBLOCK)
                 serverLog(LL_WARNING,
                     "Accepting client connection: %s", server.neterr);
             return;
         }
         serverLog(LL_VERBOSE,"Accepted %s:%d", cip, cport);
-        acceptCommonHandler(connCreateAcceptedSocket(cfd, NULL),0,cip);
+        acceptCommonHandler(connCreateAcceptedSocket(el,cfd,NULL), 0, cip);
     }
 }
 
@@ -396,6 +408,10 @@ static ConnectionType CT_Socket = {
     .connect = connSocketConnect,
     .blocking_connect = connSocketBlockingConnect,
     .accept = connSocketAccept,
+
+    /* event loop */
+    .unbind_event_loop = NULL,
+    .rebind_event_loop = connSocketRebindEventLoop,
 
     /* IO */
     .write = connSocketWrite,

@@ -5,8 +5,9 @@
 # Copyright (c) 2024-present, Valkey contributors.
 # All rights reserved.
 #
-# Licensed under your choice of the Redis Source Available License 2.0
-# (RSALv2) or the Server Side Public License v1 (SSPLv1).
+# Licensed under your choice of (a) the Redis Source Available License 2.0
+# (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+# GNU Affero General Public License v3 (AGPLv3).
 #
 # Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
 #
@@ -166,7 +167,12 @@ start_server {tags {"querybuf"}} {
         # The client executing the command is currently using the reusable query buffer,
         # so the size shown is that of the reusable query buffer. It will be returned
         # to the reusable query buffer after command execution.
-        assert_match {*qbuf=26 qbuf-free=* cmd=client|list *} $res
+        # Note that if IO threads are enabled, the reusable query buffer will be dereferenced earlier.
+        if {[lindex [r config get io-threads] 1] == 1} {
+            assert_match {*qbuf=26 qbuf-free=* cmd=client|list *} $res
+        } else {
+            assert_match {*qbuf=0 qbuf-free=* cmd=client|list *} $res
+        }
 
         $rd close
     } 
