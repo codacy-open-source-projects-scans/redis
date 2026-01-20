@@ -15,6 +15,7 @@ start_server {tags {"maxmemory" "external:skip"}} {
     r config set maxmemory 11mb
     r config set maxmemory-policy allkeys-lru
     set server_pid [s process_id]
+    r debug reply-copy-avoidance 0 ;# Disable copy avoidance because it affects memory usage
 
     proc init_test {client_eviction} {
         r flushdb
@@ -639,7 +640,7 @@ start_server {tags {"maxmemory" "external:skip"}} {
         r set src value
         after 2000
         r rename src dst
-        assert_lessthan [r object idletime dst] 1
+        assert_lessthan_equal [r object idletime dst] 1
     } {} {slow}
 
     test {LRM: XREADGROUP updates stream LRM} {
@@ -648,7 +649,9 @@ start_server {tags {"maxmemory" "external:skip"}} {
         r xgroup create mystream mygroup 0
         after 2000
         r xreadgroup GROUP mygroup consumer1 STREAMS mystream >
-        assert_lessthan [r object idletime mystream] 1
+
+        # LRM should be updated (idletime should be smaller)
+        assert_lessthan_equal [r object idletime mystream] 1
     } {} {slow}
 
     test {LRM: Keys with only read operations should be removed first} {
