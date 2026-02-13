@@ -338,6 +338,7 @@ static list *modulePostExecUnitJobs;
 /* Data structures related to the exported dictionary data structure. */
 typedef struct RedisModuleDict {
     rax *rax;                       /* The radix tree. */
+    size_t alloc_size;              /* Total memory used (in bytes) by this dict. */
 } RedisModuleDict;
 
 typedef struct RedisModuleDictIter {
@@ -5970,7 +5971,7 @@ int RM_StreamAdd(RedisModuleKey *key, int flags, RedisModuleStreamID *id, RedisM
         use_id_ptr = &use_id;
     }
 
-    size_t oldsize = kvobjAllocSize(key->kv);
+    size_t oldsize = server.memory_tracking_enabled ? kvobjAllocSize(key->kv) : 0;
     if (streamAppendItem(s,argv,numfields,&added_id,use_id_ptr,1) == C_ERR) {
         /* Either the ID not greater than all existing IDs in the stream, or
          * the elements are too large to be stored. either way, errno is already
@@ -6023,7 +6024,7 @@ int RM_StreamDelete(RedisModuleKey *key, RedisModuleStreamID *id) {
         return REDISMODULE_ERR;
     }
     stream *s = key->kv->ptr;
-    size_t oldsize = kvobjAllocSize(key->kv);
+    size_t oldsize = server.memory_tracking_enabled ? kvobjAllocSize(key->kv) : 0;
     streamID streamid = {id->ms, id->seq};
     if (streamDeleteItem(s, &streamid)) {
         if (server.memory_tracking_enabled)
@@ -6327,7 +6328,7 @@ long long RM_StreamTrimByLength(RedisModuleKey *key, int flags, long long length
     }
     int approx = flags & REDISMODULE_STREAM_TRIM_APPROX ? 1 : 0;
     stream *s = key->kv->ptr;
-    size_t oldsize = kvobjAllocSize(key->kv);
+    size_t oldsize = server.memory_tracking_enabled ? kvobjAllocSize(key->kv) : 0;
     long long retval = streamTrimByLength(s, length, approx);
     if (server.memory_tracking_enabled)
         updateSlotAllocSize(key->db, getKeySlot(key->key->ptr), key->kv, oldsize, kvobjAllocSize(key->kv));
@@ -6363,7 +6364,7 @@ long long RM_StreamTrimByID(RedisModuleKey *key, int flags, RedisModuleStreamID 
     int approx = flags & REDISMODULE_STREAM_TRIM_APPROX ? 1 : 0;
     streamID minid = (streamID){id->ms, id->seq};
     stream *s = key->kv->ptr;
-    size_t oldsize = kvobjAllocSize(key->kv);
+    size_t oldsize = server.memory_tracking_enabled ? kvobjAllocSize(key->kv) : 0;
     long long retval = streamTrimByID(s, minid, approx);
     if (server.memory_tracking_enabled)
         updateSlotAllocSize(key->db, getKeySlot(key->key->ptr), key->kv, oldsize, kvobjAllocSize(key->kv));
@@ -10728,8 +10729,10 @@ RedisModuleString *RM_GetClientCertificate(RedisModuleCtx *ctx, uint64_t client_
  *    Next / Prev dictionary iterator calls.
  */
 RedisModuleDict *RM_CreateDict(RedisModuleCtx *ctx) {
-    struct RedisModuleDict *d = zmalloc(sizeof(*d));
-    d->rax = raxNew();
+    size_t usable;
+    RedisModuleDict *d = zmalloc_usable(sizeof(*d), &usable);
+    d->alloc_size = usable;
+    d->rax = raxNewWithMetadata(0, &d->alloc_size);
     if (ctx != NULL) autoMemoryAdd(ctx,REDISMODULE_AM_DICT,d);
     return d;
 }
@@ -11682,11 +11685,7 @@ size_t RM_MallocSizeString(RedisModuleString* str) {
  * it does not include the allocation size of the keys and values.
  */
 size_t RM_MallocSizeDict(RedisModuleDict* dict) {
-    size_t size = sizeof(RedisModuleDict) + sizeof(rax);
-    size += dict->rax->numnodes * sizeof(raxNode);
-    /* For more info about this weird line, see streamRadixTreeMemoryUsage */
-    size += dict->rax->numnodes * sizeof(long)*30;
-    return size;
+    return dict->alloc_size;
 }
 
 /* Return the a number between 0 to 1 indicating the amount of memory
@@ -15002,6 +15001,8 @@ RedisModuleDict *RM_DefragRedisModuleDict(RedisModuleDefragCtx *ctx, RedisModule
         rax* newrax = NULL;
         if ((newdict = activeDefragAlloc(dict)))
             dict = newdict;
+        /* Update rax back-pointer to dict */
+        dict->rax->alloc_size = &dict->alloc_size;
         if ((newrax = activeDefragAlloc(dict->rax)))
             dict->rax = newrax;
     }
