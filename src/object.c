@@ -22,6 +22,8 @@
 #define strtold(a,b) ((long double)strtod((a),(b)))
 #endif
 
+static_assert(sizeof(kvBits) == 1, "kvBits must be a single byte");
+
 /* Map a metadata ID (bit index) to its compacted slot number among set bits,
  * then return a pointer to that slot. Caller must ensure the ID bit is set. */
 uint64_t *kvobjMetaRef(kvobj *kv, int metaId) {
@@ -52,9 +54,9 @@ uint64_t *kvobjMetaRef(kvobj *kv, int metaId) {
  * 
  * Example of "mykey" with expiration and metadata :
  * 
- *    +------------+------------+-----------+------------------+------------------------+
- *    | m.meta (8) | expiry (8) | robj (16) | key-hdr-size (1) | sdshdr5 "mykey" \0 (7) | 
- *    +------------+------------+-----------+------------------+------------------------+
+ *    +------------+------------+-----------+------------+------------------------+
+ *    | m.meta (8) | expiry (8) | robj (16) | kvbits (1) | sdshdr5 "mykey" \0 (7) | 
+ *    +------------+------------+-----------+------------+------------------------+
  *                              ^
  *                              |
  *                              kvobjCreate() returns pointer to here
@@ -74,11 +76,12 @@ kvobj *kvobjCreate(int type, const sds key, void *ptr, uint32_t keyMetaBits) {
     /* Calculate embedded key size */
     char key_sds_type = sdsReqType(key_sds_len);
     size_t key_sds_size = sdsReqSize(key_sds_len, key_sds_type);
+    debugServerAssert(key_sds_type <= SDS_TYPE_32); /* keys are never > 4GB */
 
     /* Compute the base object size */
-    size_t min_size = sizeof(robj);
+    size_t min_size = sizeof(robj) + sizeof(kvBits);
     min_size += sizeMetas;
-    min_size += 1 + key_sds_size; /* 1 byte for SDS header size */
+    min_size += key_sds_size;
 
     /* Allocate object memory */
     char *alloc = zmalloc(min_size);
@@ -90,12 +93,12 @@ kvobj *kvobjCreate(int type, const sds key, void *ptr, uint32_t keyMetaBits) {
     kv->lru = 0;
     kv->iskvobj = 1;
     kv->metabits = keyMetaBits;
+    kvobjBits(kv)->key_sds_type = key_sds_type;
+    kvobjBits(kv)->no_evict = 0;
+    kvobjBits(kv)->unused = 0;
 
-    /* The memory after the struct where we embedded data. */
-    char *data = (void *)(kv + 1);
-
-    /* Store embedded key. */
-    *data++ = sdsHdrSize(key_sds_type);
+    /* Store embedded key, right after the kvBits. */
+    char *data = (char *) (kvobjBits(kv) + 1);
     sdsnewplacement(data, key_sds_size, key_sds_type, key, key_sds_len);
 
     /* Reset each allocated metadata to its reset_value (such as Expiry=-1, etc) */
@@ -156,9 +159,9 @@ robj *createRawStringObject(const char *ptr, size_t len) {
  * expire to the new object. LRU is set to 0. 
  * 
  * Example of kvobj "mykey" with embedded "myvalue" (16+1+7+11 = 35bytes):
- *    +-----------+------------------+------------------------+----------------------------+
- *    | robj (16) | key-hdr-size (1) | sdshdr5 "mykey" \0 (7) | sdshdr8 "myvalue" \0  (11) | 
- *    +-----------+------------------+------------------------+----------------------------+
+ *    +-----------+------------+------------------------+----------------------------+
+ *    | robj (16) | kvbits (1) | sdshdr5 "mykey" \0 (7) | sdshdr8 "myvalue" \0  (11) | 
+ *    +-----------+------------+------------------------+----------------------------+
  */
 static kvobj *kvobjCreateEmbedString(const char *val_ptr, size_t val_len,
                                      const sds key, uint32_t keyMetaBits)
@@ -171,14 +174,15 @@ static kvobj *kvobjCreateEmbedString(const char *val_ptr, size_t val_len,
     size_t key_sds_len = sdslen(key);
     char key_sds_type = sdsReqType(key_sds_len);
     size_t key_sds_size = sdsReqSize(key_sds_len, key_sds_type);
+    debugServerAssert(key_sds_type <= SDS_TYPE_32); /* keys are never > 4GB */
 
     /* Calculate size for embedded value (always SDS_TYPE_8) */
     size_t val_sds_size = sdsReqSize(val_len, SDS_TYPE_8);
 
     /* Compute base object size */
-    size_t min_size = sizeof(robj) + val_sds_size;
+    size_t min_size = sizeof(robj) + sizeof(kvBits) + val_sds_size;
     min_size += sizeMetas;
-    min_size += 1 + key_sds_size; /* 1 byte for SDS header size */
+    min_size += key_sds_size;
 
     /* Allocate object memory */
     size_t bufsize = 0;
@@ -191,11 +195,12 @@ static kvobj *kvobjCreateEmbedString(const char *val_ptr, size_t val_len,
     o->lru = 0;
     o->metabits = keyMetaBits;
     o->iskvobj = 1;
+    kvobjBits(o)->key_sds_type = key_sds_type;
+    kvobjBits(o)->no_evict = 0;
+    kvobjBits(o)->unused = 0;
 
-    /* The memory after the struct where we embedded data. */
-    char *data = (char *)(o + 1);
-    /* Store embedded key */
-    *data++ = sdsHdrSize(key_sds_type);
+    /* Store embedded key, right after the kvBits. */
+    char *data = (char *) (kvobjBits(o) + 1);
     sdsnewplacement(data, key_sds_size, key_sds_type, key, key_sds_len);
     data += key_sds_size;
 
@@ -213,12 +218,12 @@ static kvobj *kvobjCreateEmbedString(const char *val_ptr, size_t val_len,
  * an object where the sds string is actually an unmodifiable string
  * allocated in the same chunk as the object itself.
  * 
- * Example of robj with embedded "myvalue" (16+1+11 = 28 bytes):
- *    +-----------+------------------+----------------------------+
- *    | robj (16) | key-hdr-size (1) | sdshdr8 "myvalue" \0  (11) | 
- *    +-----------+------------------+----------------------------+
+ * Example of robj with embedded "myvalue" (16+11 = 27 bytes):
+ *    +-----------+----------------------------+
+ *    | robj (16) | sdshdr8 "myvalue" \0  (11) | 
+ *    +-----------+----------------------------+
  */
-robj *createEmbeddedStringObject(const char *val_ptr, size_t val_len) {
+static inline robj *createEmbeddedStringObject(const char *val_ptr, size_t val_len) {
     /* Calculate size for embedded value (always SDS_TYPE_8) */
     size_t val_sds_size = sdsReqSize(val_len, SDS_TYPE_8);
     
@@ -242,12 +247,15 @@ robj *createEmbeddedStringObject(const char *val_ptr, size_t val_len) {
     return o;
 }
 
+/* SDS header size of the embedded key, indexed by kvBits->key_sds_type. */
 sds kvobjGetKey(const kvobj *kv) {
-    unsigned char *data = (void *)(kv + 1);
+    static const uint8_t kvobjKeyHdrSize[4] = {
+        sizeof(struct sdshdr5), sizeof(struct sdshdr8),
+        sizeof(struct sdshdr16), sizeof(struct sdshdr32)
+    };
     debugServerAssert(kv->iskvobj);
-    uint8_t hdr_size = *(uint8_t *)data;
-    data += 1 + hdr_size;
-    return (sds)data;
+    kvBits *bits = kvobjBits(kv);
+    return (sds) ((char *) (bits + 1) + kvobjKeyHdrSize[bits->key_sds_type]);
 }
 
 long long kvobjGetExpire(const kvobj *kv) {
@@ -286,8 +294,8 @@ kvobj *kvobjSet(sds key, robj *val, uint32_t keyMetaBits) {
 
         /* Embed when the sum is less than a cache line (Metadata is discarded 
          * since we don't have to be accurate and it is placed before the object) */
-        size_t size = sizeof(kvobj);
-        size += (key != NULL) * (sdslen(key) + 3); /* hdr size (1) + hdr (1) + nullterm (1) */
+        size_t size = sizeof(kvobj) + sizeof(kvBits);
+        size += (key != NULL) * (sdslen(key) + 2); /* sds hdr (1) + nullterm (1) */
         size += 4 + len; /* embstr header (3) + nullterm (1) */
         if (size <= CACHE_LINE_SIZE) {
             kv = kvobjCreateEmbedString(val->ptr, len, key, keyMetaBits);
@@ -319,6 +327,7 @@ kvobj *kvobjSet(sds key, robj *val, uint32_t keyMetaBits) {
     }
     
     kv->lru = val->lru;
+    if (val->iskvobj) kvobjBits(kv)->no_evict = kvobjBits(val)->no_evict;
 
     /* Transfer module metadata from `val` to new `kv` (if `val` of type kvobj with metadata). */
     if (val->metabits & KEY_META_MASK_MODULES)
@@ -514,6 +523,7 @@ robj *createStreamObject(void) {
     return o;
 }
 
+#ifdef ENABLE_GCRA
 robj *createGCRAObject(long long value) {
     /* NOTE: for 32-bit systems we can't use integer encoding (as OBJ_STRING does)
      * as the GCRA object is a unixtime value in microseconds, which as of the
@@ -528,6 +538,14 @@ robj *createGCRAObject(long long value) {
 #endif
 
     o->encoding = OBJ_ENCODING_INT;
+    return o;
+}
+#endif
+
+robj *createArrayObject(void) {
+    redisArray *ar = arNew();
+    robj *o = createObject(OBJ_ARRAY, ar);
+    o->encoding = OBJ_ENCODING_SLICED_ARRAY;
     return o;
 }
 
@@ -603,12 +621,18 @@ void freeStreamObject(robj *o) {
     freeStream(o->ptr);
 }
 
+#ifdef ENABLE_GCRA
 void freeGCRAObject(robj *o) {
 #if UINTPTR_MAX == 0xffffffff
     zfree(o->ptr);
 #else
     (void)o;
 #endif
+}
+#endif
+
+void freeArrayObject(robj *o) {
+    arFree(o->ptr);
 }
 
 void incrRefCount(robj *o) {
@@ -635,6 +659,14 @@ void decrRefCount(robj *o) {
     }
 
     if (--(o->refcount) == 0) {
+        /* Fast path for embedded strings: no inner allocation to free, and we
+         * can compute the alloc size to hint jemalloc for a faster deallocation. */
+        if (o->type == OBJ_STRING && o->encoding == OBJ_ENCODING_EMBSTR && !o->iskvobj) {
+            serverAssert(sdsType(o->ptr) == SDS_TYPE_8); /* embstr always type_8 */
+            zfree_with_size(o, sizeof(robj) + sdsAllocSize(o->ptr));
+            return;
+        }
+
         void *alloc = o;
         
         if (o->iskvobj) {
@@ -654,7 +686,10 @@ void decrRefCount(robj *o) {
             case OBJ_HASH: freeHashObject(o); break;
             case OBJ_MODULE: freeModuleObject(o); break;
             case OBJ_STREAM: freeStreamObject(o); break;
+#ifdef ENABLE_GCRA
             case OBJ_GCRA: freeGCRAObject(o); break;
+#endif
+            case OBJ_ARRAY: freeArrayObject(o); break;
             default: serverPanic("Unknown object type"); break;
             }
         }
@@ -777,6 +812,19 @@ void dismissHashObject(robj *o, size_t size_hint) {
     } else if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
         listpackEx *lpt = o->ptr;
         dismissMemory(lpt->lp, lpBytes((unsigned char*)lpt->lp));
+    } else if (o->encoding == OBJ_ENCODING_TMPL_LP) {
+        unsigned char *lp = o->ptr;
+        dismissMemory(lp, lpBytes(lp));
+    } else if (o->encoding == OBJ_ENCODING_TMPL_ARRAY) {
+        hashTemplateArray *hta = o->ptr;
+        unsigned long long n = hta->field_count;
+        /* We iterate all values only when average value size is bigger than
+         * a page size, mirroring the heuristic used for OBJ_ENCODING_HT. */
+        if (n > 0 && size_hint / n >= server.page_size) {
+            for (unsigned long long i = 0; i < n; i++)
+                dismissSds(hta->values[i]);
+        }
+        dismissMemory(hta, sizeof(*hta) + n * sizeof(sds));
     } else {
         serverPanic("Unknown hash encoding type");
     }
@@ -802,12 +850,19 @@ void dismissStreamObject(robj *o, size_t size_hint) {
     }
 }
 
+/* See dismissObject() */
+void dismissArrayObject(robj *o, size_t size_hint) {
+    arDismiss(o->ptr, size_hint);
+}
+
+#ifdef ENABLE_GCRA
 void dismissGCRAObject(robj *o, size_t size_hint) {
     /* GCRA is a single allocation of a long long thus way smaller than a
      * page-size. The dismiss mechanism is not needed for it - hence NOOP.*/
     (void)o;
     (void)size_hint;
 }
+#endif
 
 /* When creating a snapshot in a fork child process, the main process and child
  * process share the same physical memory pages, and if / when the parent
@@ -837,7 +892,10 @@ void dismissObject(robj *o, size_t size_hint) {
         case OBJ_ZSET: dismissZsetObject(o, size_hint); break;
         case OBJ_HASH: dismissHashObject(o, size_hint); break;
         case OBJ_STREAM: dismissStreamObject(o, size_hint); break;
+#ifdef ENABLE_GCRA
         case OBJ_GCRA: dismissGCRAObject(o, size_hint); break;
+#endif
+        case OBJ_ARRAY: dismissArrayObject(o, size_hint); break;
         default: break;
     }
 #else
@@ -959,7 +1017,10 @@ size_t getObjectLength(robj *o) {
         case OBJ_ZSET: return zsetLength(o);
         case OBJ_HASH: return hashTypeLength(o, 0);
         case OBJ_STREAM: return streamLength(o);
+#ifdef ENABLE_GCRA
         case OBJ_GCRA: return gcraObjectLength(o);
+#endif
+        case OBJ_ARRAY: return arCount(o->ptr);
         default: return 0;
     }
 }
@@ -1168,6 +1229,7 @@ int getLongLongFromObject(robj *o, long long *target) {
     return C_OK;
 }
 
+#ifdef ENABLE_GCRA
 int getLongLongFromGCRAObject(robj *o, long long *target) {
     long long res;
     serverAssertWithInfo(NULL, o, o->type == OBJ_GCRA);
@@ -1183,6 +1245,7 @@ int getLongLongFromGCRAObject(robj *o, long long *target) {
     *target = res;
     return C_OK;
 }
+#endif
 
 int getLongLongFromObjectOrReply(client *c, robj *o, long long *target, const char *msg) {
     long long value;
@@ -1257,6 +1320,9 @@ char *strEncoding(int encoding) {
     case OBJ_ENCODING_SKIPLIST: return "skiplist";
     case OBJ_ENCODING_EMBSTR: return "embstr";
     case OBJ_ENCODING_STREAM: return "stream";
+    case OBJ_ENCODING_SLICED_ARRAY: return "sliced-array";
+	case OBJ_ENCODING_TMPL_LP: return "template-listpack";
+	case OBJ_ENCODING_TMPL_ARRAY: return "template-array";
     default: return "unknown";
     }
 }
@@ -1275,7 +1341,10 @@ size_t kvobjComputeSize(robj *key, kvobj *o, size_t sample_size, int dbid) {
         o->type == OBJ_ZSET ||
         o->type == OBJ_HASH ||
         o->type == OBJ_STREAM ||
-        o->type == OBJ_GCRA)
+#ifdef ENABLE_GCRA
+        o->type == OBJ_GCRA ||
+#endif
+        o->type == OBJ_ARRAY)
     {
         return kvobjAllocSize(o);
     } else if (o->type == OBJ_MODULE) {
@@ -1284,9 +1353,22 @@ size_t kvobjComputeSize(robj *key, kvobj *o, size_t sample_size, int dbid) {
     serverPanic("Unknown object type");
 }
 
+/* Returns the size in bytes consumed by the object header, key and value in RAM.
+ * Note that the returned value is accurate approximation of the actual allocated
+ * size. For performance reasons it accumulates requested size instead in several
+ * cases (e.g. kvobj allocation, type 5 sds, listpacks, etc) but it does so in a
+ * self-consistent way.
+ */
 size_t kvobjAllocSize(kvobj *o) {
-    /* All kv-objects has at least kvobj header and embedded key */
-    size_t asize = zmalloc_size(kvobjGetAllocPtr(o));
+    debugServerAssert(o->iskvobj);
+    size_t asize = sizeof(kvobj) + sizeof(kvBits);
+    /* Add metadata size */
+    asize += getNumMeta(o->metabits) * sizeof(uint64_t);
+    /* Add embedded key size */
+    asize += sdsAllocSize(kvobjGetKey(o));
+    /* Add embedded string size */
+    if (o->encoding == OBJ_ENCODING_EMBSTR)
+        asize += sdsAllocSize(o->ptr);
 
     if (o->type == OBJ_STRING) {
         asize += stringObjectAllocSize(o);
@@ -1301,14 +1383,20 @@ size_t kvobjAllocSize(kvobj *o) {
     } else if (o->type == OBJ_STREAM) {
         stream *s = o->ptr;
         asize += s->alloc_size;
+#ifdef ENABLE_GCRA
     } else if (o->type == OBJ_GCRA) {
         asize += gcraTypeAllocSize(o);
+#endif
+    } else if (o->type == OBJ_ARRAY) {
+        redisArray *ar = o->ptr;
+        asize += ar->alloc_size;
     } else if (o->type == OBJ_MODULE) {
         /* TODO: Provide moduleGetAllocSize() module API for O(1) allocation size retrieval */
     }
     return asize;
 }
 
+#ifdef ENABLE_GCRA
 size_t gcraTypeAllocSize(robj *o) {
     (void)o;
 #if UINTPTR_MAX == 0xffffffff
@@ -1325,6 +1413,7 @@ size_t gcraObjectLength(robj *o) {
     (void)o;
     return 1;
 }
+#endif
 
 /* Release data obtained with getMemoryOverheadData(). */
 void freeMemoryOverheadData(struct redisMemOverhead *mh) {
@@ -1382,6 +1471,21 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
         mh->clients_slaves = 0;
         mh->repl_backlog = server.repl_buffer_mem;
     }
+
+    /* Replicas' compression state is allocated per client and is not part of
+     * the shared replication buffer accounted for above, so it needs to be
+     * added separately regardless of which branch was taken. */
+    if (listLength(server.slaves)) {
+        listIter li;
+        listNode *ln;
+
+        listRewind(server.slaves, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            client *replica = listNodeValue(ln);
+            mh->clients_slaves += clientCompressionMemoryUsage(replica);
+        }
+    }
+
     if (server.repl_backlog) {
         /* The approximate memory of rax tree for indexed blocks. */
         mh->repl_backlog +=
@@ -1393,6 +1497,9 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
     mem_total += mh->replica_fullsync_buffer;
     mem_total += mh->repl_backlog;
     mem_total += mh->clients_slaves;
+
+    /* Compute shared/unshared reply memory. */
+    getClientsSharedMemoryUsage(&mh->clients_normal_shared, &mh->clients_normal_unshared);
 
     /* Computing the memory used by the clients would be O(N) if done
      * here online. We use our values computed incrementally by
@@ -1422,9 +1529,12 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
     mh->script_vm += functionsMemoryVM();
     mem_total+=mh->script_vm;
 
+    mh->hash_templates = hashTemplatesMemUsage();
+    mem_total+=mh->hash_templates;
+
     /* Cluster atomic slot migration buffers. */
     mh->asm_import_input_buffer = asmGetImportInputBufferSize();
-    mh->asm_migrate_output_buffer = asmGetMigrateOutputBufferSize();
+    mh->asm_migrate_output_buffer = asmGetMigrateOutputMemoryUsage();
     mem_total += mh->asm_import_input_buffer;
     mem_total += mh->asm_migrate_output_buffer;
 
@@ -1447,14 +1557,24 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
         mh->db[mh->num_dbs].overhead_ht_expires = mem;
         mem_total+=mem;
 
+        /* The bless NO-EVICT index (db->blessed_keys) is a derived per-DB kvstore;
+         * count it as overhead, not dataset. blessedIndexMemUsage is O(1) - the sds
+         * key-copy bytes it owns are tracked in the index's kvstore metadata. */
+        mem = blessedIndexMemUsage(db);
+        mh->db[mh->num_dbs].overhead_ht_blessed = mem;
+        mem_total+=mem;
+
         mh->num_dbs++;
 
         mh->overhead_db_hashtable_lut += kvstoreOverheadHashtableLut(db->keys);
         mh->overhead_db_hashtable_lut += kvstoreOverheadHashtableLut(db->expires);
+        mh->overhead_db_hashtable_lut += kvstoreOverheadHashtableLut(db->blessed_keys);
         mh->overhead_db_hashtable_rehashing += kvstoreOverheadHashtableRehashing(db->keys);
         mh->overhead_db_hashtable_rehashing += kvstoreOverheadHashtableRehashing(db->expires);
+        mh->overhead_db_hashtable_rehashing += kvstoreOverheadHashtableRehashing(db->blessed_keys);
         mh->db_dict_rehashing_count += kvstoreDictRehashingCount(db->keys);
         mh->db_dict_rehashing_count += kvstoreDictRehashingCount(db->expires);
+        mh->db_dict_rehashing_count += kvstoreDictRehashingCount(db->blessed_keys);
     }
 
     /* Hotkeys memory overhead */
@@ -1673,7 +1793,7 @@ NULL
     } else if (!strcasecmp(c->argv[1]->ptr,"encoding") && c->argc == 3) {
         if ((kv = kvobjCommandLookupOrReply(c, c->argv[2], shared.null[c->resp]))
                 == NULL) return;
-        addReplyBulkCString(c,strEncoding(kv->encoding));
+        addReplyBulkCString(c, strEncoding(kv->encoding));
     } else if (!strcasecmp(c->argv[1]->ptr,"idletime") && c->argc == 3) {
         if ((kv = kvobjCommandLookupOrReply(c, c->argv[2], shared.null[c->resp]))
                 == NULL) return;
@@ -1745,11 +1865,19 @@ NULL
             return;
         }
         size_t usage = kvobjComputeSize(c->argv[2], kv, samples, c->db->id);
+
+        /* Add this key's share of the hash-template cost (see the comment of
+         * hashTemplatePerKeyMemoryShare()). */
+        if (kv->type == OBJ_HASH &&
+            (kv->encoding == OBJ_ENCODING_TMPL_LP ||
+             kv->encoding == OBJ_ENCODING_TMPL_ARRAY))
+            usage += hashTemplatePerKeyMemoryShare(kv);
+
         addReplyLongLong(c,usage);
     } else if (!strcasecmp(c->argv[1]->ptr,"stats") && c->argc == 2) {
         struct redisMemOverhead *mh = getMemoryOverheadData();
 
-        addReplyMapLen(c,33+mh->num_dbs);
+        addReplyMapLen(c,36+mh->num_dbs);
 
         addReplyBulkCString(c,"peak.allocated");
         addReplyLongLong(c,mh->peak_allocated);
@@ -1772,6 +1900,12 @@ NULL
         addReplyBulkCString(c,"clients.normal");
         addReplyLongLong(c,mh->clients_normal);
 
+        addReplyBulkCString(c,"clients.normal.shared");
+        addReplyLongLong(c,mh->clients_normal_shared);
+
+        addReplyBulkCString(c,"clients.normal.unshared");
+        addReplyLongLong(c,mh->clients_normal_unshared);
+
         addReplyBulkCString(c,"cluster.links");
         addReplyLongLong(c,mh->cluster_links);
 
@@ -1787,17 +1921,23 @@ NULL
         addReplyBulkCString(c,"script.VMs");
         addReplyLongLong(c,mh->script_vm);
 
+        addReplyBulkCString(c,"hash.templates");
+        addReplyLongLong(c,mh->hash_templates);
+
         for (size_t j = 0; j < mh->num_dbs; j++) {
             char dbname[32];
             snprintf(dbname,sizeof(dbname),"db.%zd",mh->db[j].dbid);
             addReplyBulkCString(c,dbname);
-            addReplyMapLen(c,2);
+            addReplyMapLen(c,3);
 
             addReplyBulkCString(c,"overhead.hashtable.main");
             addReplyLongLong(c,mh->db[j].overhead_ht_main);
 
             addReplyBulkCString(c,"overhead.hashtable.expires");
             addReplyLongLong(c,mh->db[j].overhead_ht_expires);
+
+            addReplyBulkCString(c,"overhead.hashtable.blessed");
+            addReplyLongLong(c,mh->db[j].overhead_ht_blessed);
         }
 
         addReplyBulkCString(c,"overhead.db.hashtable.lut");
